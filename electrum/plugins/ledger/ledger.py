@@ -6,7 +6,9 @@ import base64
 import hashlib
 from typing import Dict, List, Optional, Sequence, Tuple, TYPE_CHECKING
 
-from electrum import bip32, constants, ecc
+import electrum_ecc as ecc
+
+from electrum import bip32, constants
 from electrum import descriptor
 from electrum.bip32 import BIP32Node, convert_bip32_intpath_to_strpath, normalize_bip32_derivation
 from electrum.bitcoin import EncodeBase58Check, is_b58_address, is_segwit_script_type, var_int
@@ -1330,7 +1332,7 @@ class Ledger_KeyStore(Hardware_KeyStore):
 class LedgerPlugin(HW_PluginBase):
     keystore_class = Ledger_KeyStore
     minimum_library = (0, 2, 0)
-    maximum_library = (0, 3, 0)
+    maximum_library = (0, 4, 0)
     DEVICE_IDS = [(0x2581, 0x1807),  # HW.1 legacy btchip
                   (0x2581, 0x2b7c),  # HW.1 transitional production
                   (0x2581, 0x3b7c),  # HW.1 ledger production
@@ -1340,7 +1342,7 @@ class LedgerPlugin(HW_PluginBase):
                   (0x2c97, 0x0004),  # Nano-X
                   (0x2c97, 0x0005),  # Nano-S Plus
                   (0x2c97, 0x0006),  # Stax
-                  (0x2c97, 0x0007),  # RFU
+                  (0x2c97, 0x0007),  # Flex
                   (0x2c97, 0x0008),  # RFU
                   (0x2c97, 0x0009),  # RFU
                   (0x2c97, 0x000a)]  # RFU
@@ -1350,6 +1352,7 @@ class LedgerPlugin(HW_PluginBase):
         0x40: "Ledger Nano X",
         0x50: "Ledger Nano S Plus",
         0x60: "Ledger Stax",
+        0x70: "Ledger Flex",
     }
 
     SUPPORTED_XTYPES = ('standard', 'p2wpkh-p2sh', 'p2wpkh', 'p2wsh-p2sh', 'p2wsh')
@@ -1399,6 +1402,8 @@ class LedgerPlugin(HW_PluginBase):
                 return True, "Ledger Nano S Plus"
             if product_key == (0x2c97, 0x0006):
                 return True, "Ledger Stax"
+            if product_key == (0x2c97, 0x0007):
+                return True, "Ledger Flex"
             return True, None
         # modern product_keys
         if product_key[0] == 0x2c97:

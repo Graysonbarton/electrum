@@ -145,6 +145,11 @@ class NotEnoughFunds(Exception):
         return _("Insufficient funds")
 
 
+class UneconomicFee(Exception):
+    def __str__(self):
+        return _("The fee for the transaction is higher than the funds gained from it.")
+
+
 class NoDynamicFeeEstimates(Exception):
     def __str__(self):
         return _('Dynamic fee estimates not available')
@@ -987,6 +992,13 @@ testnet_block_explorers = {
                        {'tx': 'tx/', 'addr': 'address/'}),
 }
 
+testnet4_block_explorers = {
+    'mempool.space': ('https://mempool.space/testnet4/',
+                        {'tx': 'tx/', 'addr': 'address/'}),
+    'wakiyamap.dev': ('https://testnet4-explorer.wakiyamap.dev/',
+                       {'tx': 'tx/', 'addr': 'address/'}),
+}
+
 signet_block_explorers = {
     'bc-2.jp': ('https://explorer.bc-2.jp/',
                         {'tx': 'tx/', 'addr': 'address/'}),
@@ -1009,6 +1021,8 @@ def block_explorer_info():
     from . import constants
     if constants.net.NET_NAME == "testnet":
         return testnet_block_explorers
+    elif constants.net.NET_NAME == "testnet4":
+        return testnet4_block_explorers
     elif constants.net.NET_NAME == "signet":
         return signet_block_explorers
     return mainnet_block_explorers
@@ -1837,6 +1851,11 @@ _event_listeners = defaultdict(set)  # type: Dict[str, Set[str]]
 
 
 class EventListener:
+    """Use as a mixin for a class that has methods to be triggered on events.
+    - Methods that receive the callbacks should be named "on_event_*" and decorated with @event_listener.
+    - register_callbacks() should be called exactly once per instance of EventListener, e.g. in __init__
+    - unregister_callbacks() should be called at least once, e.g. when the instance is destroyed
+    """
 
     def _list_callbacks(self):
         for c in self.__class__.__mro__:
@@ -1859,6 +1878,7 @@ class EventListener:
 
 
 def event_listener(func):
+    """To be used in subclasses of EventListener only. (how to enforce this programmatically?)"""
     classname, method_name = func.__qualname__.split('.')
     assert method_name.startswith('on_event_')
     classpath = f"{func.__module__}.{classname}"
@@ -1931,7 +1951,7 @@ class NetworkRetryManager(Generic[_NetAddrType]):
         self._last_tried_addr.clear()
 
 
-class MySocksProxy(aiorpcx.SOCKSProxy):
+class ESocksProxy(aiorpcx.SOCKSProxy):
     # note: proxy will not leak DNS as create_connection()
     # sets (local DNS) resolve=False by default
 
@@ -1945,12 +1965,17 @@ class MySocksProxy(aiorpcx.SOCKSProxy):
         return reader, writer
 
     @classmethod
-    def from_proxy_dict(cls, proxy: dict = None) -> Optional['MySocksProxy']:
-        if not proxy:
+    def from_network_settings(cls, network: Optional['Network']) -> Optional['ESocksProxy']:
+        if not network or not network.proxy:
             return None
+        proxy = network.proxy
         username, pw = proxy.get('user'), proxy.get('password')
         if not username or not pw:
-            auth = None
+            # is_proxy_tor is tri-state; None indicates it is still probing the proxy to test for TOR
+            if network.is_proxy_tor:
+                auth = aiorpcx.socks.SOCKSRandomAuth()
+            else:
+                auth = None
         else:
             auth = aiorpcx.socks.SOCKSUserAuth(username, pw)
         addr = aiorpcx.NetAddress(proxy['host'], proxy['port'])
