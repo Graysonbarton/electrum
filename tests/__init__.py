@@ -28,6 +28,7 @@ class ElectrumTestCase(unittest.IsolatedAsyncioTestCase, Logger):
     """Base class for our unit tests."""
 
     TESTNET = False
+    TEST_ANCHOR_CHANNELS = False
     # maxDiff = None  # for debugging
 
     # some unit tests are modifying globals... so we run sequentially:
@@ -41,13 +42,13 @@ class ElectrumTestCase(unittest.IsolatedAsyncioTestCase, Logger):
     def setUpClass(cls):
         super().setUpClass()
         if cls.TESTNET:
-            constants.set_testnet()
+            constants.BitcoinTestnet.set_as_network()
 
     @classmethod
     def tearDownClass(cls):
         super().tearDownClass()
         if cls.TESTNET:
-            constants.set_mainnet()
+            constants.BitcoinMainnet.set_as_network()
 
     def setUp(self):
         self._test_lock.acquire()
@@ -79,14 +80,14 @@ def as_testnet(func):
     if asyncio.iscoroutinefunction(func):
         async def run_test(*args, **kwargs):
             try:
-                constants.set_testnet()
+                constants.BitcoinTestnet.set_as_network()
                 return await func(*args, **kwargs)
             finally:
                 constants.net = old_net
     else:
         def run_test(*args, **kwargs):
             try:
-                constants.set_testnet()
+                constants.BitcoinTestnet.set_as_network()
                 return func(*args, **kwargs)
             finally:
                 constants.net = old_net

@@ -10,12 +10,13 @@ from decimal import Decimal
 from typing import Optional, TYPE_CHECKING, Type, Dict, Any, Union, Sequence, List, Tuple
 import random
 
+import electrum_ecc as ecc
+
 from .bitcoin import hash160_to_b58_address, b58_address_to_hash160, TOTAL_COIN_SUPPLY_LIMIT_IN_BTC
 from .segwit_addr import bech32_encode, bech32_decode, CHARSET, CHARSET_INVERSE, convertbits
 from . import segwit_addr
 from . import constants
 from .constants import AbstractNet
-from . import ecc
 from .bitcoin import COIN
 
 if TYPE_CHECKING:
@@ -106,9 +107,6 @@ def parse_fallback_addr(data5: Sequence[int], net: Type[AbstractNet]) -> Optiona
     else:
         return None
     return addr
-
-
-BOLT11_HRP_INV_DICT = {net.BOLT11_HRP: net for net in constants.NETS_LIST}
 
 
 def tagged5(char: str, data5: Sequence[int]) -> Sequence[int]:
@@ -420,18 +418,16 @@ def lndecode(invoice: str, *, verbose=False, net=None) -> LnAddr:
 
     addr = LnAddr()
     addr.pubkey = None
+    addr.net = net
 
-    m = re.search("[^\\d]+", hrp[2:])
-    if m:
-        addr.net = BOLT11_HRP_INV_DICT[m.group(0)]
-        amountstr = hrp[2+m.end():]
-        # BOLT #11:
-        #
-        # A reader SHOULD indicate if amount is unspecified, otherwise it MUST
-        # multiply `amount` by the `multiplier` value (if any) to derive the
-        # amount required for payment.
-        if amountstr != '':
-            addr.amount = unshorten_amount(amountstr)
+    amountstr = hrp[2+len(net.BOLT11_HRP):]
+    # BOLT #11:
+    #
+    # A reader SHOULD indicate if amount is unspecified, otherwise it MUST
+    # multiply `amount` by the `multiplier` value (if any) to derive the
+    # amount required for payment.
+    if amountstr != '':
+        addr.amount = unshorten_amount(amountstr)
 
     addr.date = int_from_data5(data5_remaining[:7])
     data5_remaining = data5_remaining[7:]

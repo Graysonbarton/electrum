@@ -28,11 +28,12 @@ from typing import List, Tuple, TYPE_CHECKING, Optional, Union, Sequence, Any
 import enum
 from enum import IntEnum, Enum
 
+import electrum_ecc as ecc
+
 from .util import bfh, BitcoinException, assert_bytes, to_bytes, inv_dict, is_hex_str, classproperty
 from . import version
 from . import segwit_addr
 from . import constants
-from . import ecc
 from .crypto import sha256d, sha256, hash_160, hmac_oneshot
 
 if TYPE_CHECKING:
@@ -798,6 +799,7 @@ def taproot_tweak_seckey(seckey0: bytes, h: bytes) -> bytes:
 TapTreeLeaf = Tuple[int, bytes]
 TapTree = Union[TapTreeLeaf, Sequence['TapTree']]
 
+# FIXME just use electrum_ecc.util.bip340_tagged_hash instead
 def bip340_tagged_hash(tag: bytes, msg: bytes) -> bytes:
     # note: _libsecp256k1.secp256k1_tagged_sha256 benchmarks about 70% slower than this (on my machine)
     return sha256(sha256(tag) + sha256(tag) + msg)
@@ -845,7 +847,6 @@ def control_block_for_taproot_script_spend(
 
 # user message signing
 def usermessage_magic(message: bytes) -> bytes:
-    from .bitcoin import var_int
     length = var_int(len(message))
     return b"\x18Bitcoin Signed Message:\n" + length + message
 
@@ -855,8 +856,7 @@ def ecdsa_sign_usermessage(ec_privkey, message: Union[bytes, str], *, is_compres
     return ec_privkey.ecdsa_sign_recoverable(msg32, is_compressed=is_compressed)
 
 def verify_usermessage_with_address(address: str, sig65: bytes, message: bytes, *, net=None) -> bool:
-    from .bitcoin import pubkey_to_address
-    from .ecc import ECPubkey
+    from electrum_ecc import ECPubkey
     assert_bytes(sig65, message)
     if net is None: net = constants.net
     h = sha256d(usermessage_magic(message))

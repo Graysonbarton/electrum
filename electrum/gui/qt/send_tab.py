@@ -4,27 +4,28 @@
 
 from decimal import Decimal
 from typing import Optional, TYPE_CHECKING, Sequence, List, Callable, Union, Mapping
-from PyQt5.QtCore import pyqtSignal, QPoint, QSize, Qt
-from PyQt5.QtWidgets import (QLabel, QVBoxLayout, QGridLayout, QHBoxLayout,
+
+from PyQt6.QtCore import pyqtSignal, QPoint, QSize, Qt
+from PyQt6.QtWidgets import (QLabel, QVBoxLayout, QGridLayout, QHBoxLayout,
                              QWidget, QToolTip, QPushButton, QApplication)
-from PyQt5.QtGui import QMovie, QColor
+from PyQt6.QtGui import QMovie, QColor
 
 from electrum.i18n import _
 from electrum.logging import Logger
 from electrum.bitcoin import DummyAddress
 from electrum.plugin import run_hook
-from electrum.util import NotEnoughFunds, NoDynamicFeeEstimates, parse_max_spend
+from electrum.util import NotEnoughFunds, NoDynamicFeeEstimates, parse_max_spend, UserCancelled
 from electrum.invoices import PR_PAID, Invoice, PR_BROADCASTING, PR_BROADCAST
 from electrum.transaction import Transaction, PartialTxInput, PartialTxOutput
 from electrum.network import TxBroadcastError, BestEffortRequestFailed
 from electrum.payment_identifier import (PaymentIdentifierType, PaymentIdentifier, invoice_from_payment_identifier,
                                          payment_identifier_from_invoice)
+from electrum.submarine_swaps import SwapServerError
 
 from .amountedit import AmountEdit, BTCAmountEdit, SizedFreezableLineEdit
 from .paytoedit import InvalidPaymentIdentifier
 from .util import (WaitingDialog, HelpLabel, MessageBoxMixin, EnterButton, char_width_in_lineedit,
                    get_iconname_camera, read_QIcon, ColorScheme, icon_path)
-from .confirm_tx_dialog import ConfirmTxDialog
 from .invoice_list import InvoiceList
 
 if TYPE_CHECKING:
@@ -131,7 +132,7 @@ class SendTab(QWidget, MessageBoxMixin, Logger):
         self.paste_button.setIcon(read_QIcon('copy.png'))
         self.paste_button.setToolTip(_('Paste invoice from clipboard'))
         self.paste_button.setMaximumWidth(35)
-        self.paste_button.setFocusPolicy(Qt.NoFocus)
+        self.paste_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         grid.addWidget(self.paste_button, 0, 5)
 
         self.spinner = QMovie(icon_path('spinner.gif'))
@@ -141,7 +142,7 @@ class SendTab(QWidget, MessageBoxMixin, Logger):
         self.spinner_l.setMargin(5)
         self.spinner_l.setVisible(False)
         self.spinner_l.setMovie(self.spinner)
-        grid.addWidget(self.spinner_l, 0, 1, 1, 4, Qt.AlignRight)
+        grid.addWidget(self.spinner_l, 0, 1, 1, 4, Qt.AlignmentFlag.AlignRight)
 
         self.save_button = EnterButton(_("Save"), self.do_save_invoice)
         self.save_button.setEnabled(False)
@@ -319,27 +320,26 @@ class SendTab(QWidget, MessageBoxMixin, Logger):
         output_values = [x.value for x in outputs]
         is_max = any(parse_max_spend(outval) for outval in output_values)
         output_value = '!' if is_max else sum(output_values)
-        conf_dlg = ConfirmTxDialog(window=self.window, make_tx=make_tx, output_value=output_value)
-        if conf_dlg.not_enough_funds:
-            # note: use confirmed_only=False here, regardless of config setting,
-            #       as the user needs to get to ConfirmTxDialog to change the config setting
-            if not conf_dlg.can_pay_assuming_zero_fees(confirmed_only=False):
-                text = self.get_text_not_enough_funds_mentioning_frozen()
-                self.show_message(text)
-                return
-        tx = conf_dlg.run()
+
+        tx, is_preview = self.window.confirm_tx_dialog(make_tx, output_value)
         if tx is None:
             # user cancelled
             return
-        is_preview = conf_dlg.is_preview
 
         if tx.has_dummy_output(DummyAddress.SWAP):
             sm = self.wallet.lnworker.swap_manager
-            coro = sm.request_swap_for_tx(tx)
-            swap, invoice, tx = self.network.run_from_another_thread(coro)
-            assert not tx.has_dummy_output(DummyAddress.SWAP)
-            tx.swap_invoice = invoice
-            tx.swap_payment_hash = swap.payment_hash
+            with self.window.create_sm_transport() as transport:
+                if not self.window.initialize_swap_manager(transport):
+                    return
+                coro = sm.request_swap_for_tx(transport, tx)
+                try:
+                    swap, invoice, tx = self.window.run_coroutine_dialog(coro, _('Requesting swap invoice...'))
+                except SwapServerError as e:
+                    self.show_error(str(e))
+                    return
+                assert not tx.has_dummy_output(DummyAddress.SWAP)
+                tx.swap_invoice = invoice
+                tx.swap_payment_hash = swap.payment_hash
 
         if is_preview:
             self.window.show_transaction(tx, external_keypairs=external_keypairs, payment_identifier=payment_identifier)
@@ -672,31 +672,31 @@ class SendTab(QWidget, MessageBoxMixin, Logger):
                 can_pay_with_swap = lnworker.suggest_swap_to_send(amount_sat, coins=coins)
                 rebalance_suggestion = lnworker.suggest_rebalance_to_send(amount_sat)
                 can_rebalance = bool(rebalance_suggestion) and self.window.num_tasks() == 0
-            choices = {}
+            choices = []
             if can_rebalance:
                 msg = ''.join([
                     _('Rebalance existing channels'), '\n',
                     _('Move funds between your channels in order to increase your sending capacity.')
                 ])
-                choices[0] = msg
+                choices.append(('rebalance', msg))
             if can_pay_with_new_channel:
                 msg = ''.join([
                     _('Open a new channel'), '\n',
                     _('You will be able to pay once the channel is open.')
                 ])
-                choices[1] = msg
+                choices.append(('new_channel', msg))
             if can_pay_with_swap:
                 msg = ''.join([
                     _('Swap onchain funds for lightning funds'), '\n',
                     _('You will be able to pay once the swap is confirmed.')
                 ])
-                choices[2] = msg
+                choices.append(('swap', msg))
             if can_pay_onchain:
                 msg = ''.join([
                     _('Pay onchain'), '\n',
                     _('Funds will be sent to the invoice fallback address.')
                 ])
-                choices[3] = msg
+                choices.append(('onchain', msg))
             msg = _('You cannot pay that invoice using Lightning.')
             if lnworker and lnworker.channels:
                 num_sats_can_send = int(lnworker.num_sats_can_send())
@@ -709,16 +709,16 @@ class SendTab(QWidget, MessageBoxMixin, Logger):
             r = self.window.query_choice(msg, choices)
             if r is not None:
                 self.save_pending_invoice()
-                if r == 0:
+                if r == 'rebalance':
                     chan1, chan2, delta = rebalance_suggestion
                     self.window.rebalance_dialog(chan1, chan2, amount_sat=delta)
-                elif r == 1:
+                elif r == 'new_channel':
                     amount_sat, min_amount_sat = can_pay_with_new_channel
                     self.window.new_channel_dialog(amount_sat=amount_sat, min_amount_sat=min_amount_sat)
-                elif r == 2:
+                elif r == 'swap':
                     chan, swap_recv_amount_sat = can_pay_with_swap
                     self.window.run_swap_dialog(is_reverse=False, recv_amount_sat=swap_recv_amount_sat, channels=[chan])
-                elif r == 3:
+                elif r == 'onchain':
                     self.pay_onchain_dialog(invoice.get_outputs(), nonlocal_only=True)
             return
 
@@ -738,12 +738,14 @@ class SendTab(QWidget, MessageBoxMixin, Logger):
         if hasattr(tx, 'swap_payment_hash'):
             sm = self.wallet.lnworker.swap_manager
             swap = sm.get_swap(tx.swap_payment_hash)
-            coro = sm.wait_for_htlcs_and_broadcast(swap=swap, invoice=tx.swap_invoice, tx=tx)
-            self.window.run_coroutine_dialog(
-                coro, _('Awaiting swap payment...'),
-                on_result=lambda funding_txid: self.window.on_swap_result(funding_txid, is_reverse=False),
-                on_cancelled=lambda: sm.cancel_normal_swap(swap))
-            return
+            with sm.create_transport() as transport:
+                coro = sm.wait_for_htlcs_and_broadcast(transport, swap=swap, invoice=tx.swap_invoice, tx=tx)
+                try:
+                    funding_txid = self.window.run_coroutine_dialog(coro, _('Awaiting lightning payment...'))
+                except UserCancelled:
+                    sm.cancel_normal_swap(swap)
+                    return
+                self.window.on_swap_result(funding_txid, is_reverse=False)
 
         def broadcast_thread():
             # non-GUI thread
