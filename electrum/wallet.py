@@ -1408,6 +1408,10 @@ class Abstract_Wallet(ABC, Logger, EventListener):
                         'timestamp': 0,
                         'date': timestamp_to_datetime(0),
                         'fee_sat': 0,
+                        # fixme: there is no guarantee that there will be an onchain tx in the group
+                        'height': 0,
+                        'confirmations': 0,
+                        'txid': '----',
                     }
                     transactions[key] = parent
                 if 'bc_value' in tx_item:
@@ -2505,8 +2509,6 @@ class Abstract_Wallet(ABC, Logger, EventListener):
         if not is_mine:
             is_mine = self._learn_derivation_path_for_address_from_txinout(txin, address)
         if not is_mine:
-            if self.lnworker:
-                self.lnworker.swap_manager.add_txin_info(txin)
             return
         txin.script_descriptor = self.get_script_descriptor_for_address(address)
         txin.is_mine = True
@@ -2592,11 +2594,6 @@ class Abstract_Wallet(ABC, Logger, EventListener):
             return
         if any(DummyAddress.is_dummy_address(txout.address) for txout in tx.outputs()):
             raise DummyAddressUsedInTxException("tried to sign tx with dummy address!")
-        # note: swap signing does not require the password
-        swap = self.get_swap_by_claim_tx(tx)
-        if swap:
-            self.lnworker.swap_manager.sign_tx(tx, swap)
-            return tx
 
         # check if signing is dangerous
         sh_danger = self.check_sighash(tx)
@@ -2611,6 +2608,7 @@ class Abstract_Wallet(ABC, Logger, EventListener):
                 self.logger.info(f'sign_transaction: adding witness using make_witness')
                 privkey = txin.privkey
                 sig = tx.sign_txin(i, privkey)
+                txin.script_sig = b''
                 txin.witness = txin.make_witness(sig)
                 assert txin.is_complete()
 
@@ -3355,6 +3353,19 @@ class Abstract_Wallet(ABC, Logger, EventListener):
 
     def get_unlocked_password(self):
         return self._password_in_memory
+
+    def get_text_not_enough_funds_mentioning_frozen(self) -> str:
+        text = _('Not enough funds')
+        frozen_str = self.get_frozen_balance_str()
+        if frozen_str:
+            text += ' ' + _('({} are frozen)').format(frozen_str)
+        return text
+
+    def get_frozen_balance_str(self) -> Optional[str]:
+        frozen_bal = sum(self.get_frozen_balance())
+        if not frozen_bal:
+            return None
+        return self.config.format_amount_and_units(frozen_bal)
 
 
 class Simple_Wallet(Abstract_Wallet):

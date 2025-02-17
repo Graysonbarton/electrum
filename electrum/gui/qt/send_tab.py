@@ -25,7 +25,7 @@ from electrum.submarine_swaps import SwapServerError
 from .amountedit import AmountEdit, BTCAmountEdit, SizedFreezableLineEdit
 from .paytoedit import InvalidPaymentIdentifier
 from .util import (WaitingDialog, HelpLabel, MessageBoxMixin, EnterButton, char_width_in_lineedit,
-                   get_iconname_camera, read_QIcon, ColorScheme, icon_path)
+                   get_iconname_camera, read_QIcon, ColorScheme, icon_path, IconLabel)
 from .invoice_list import InvoiceList
 
 if TYPE_CHECKING:
@@ -126,6 +126,11 @@ class SendTab(QWidget, MessageBoxMixin, Logger):
         self.max_button.setCheckable(True)
         self.max_button.setEnabled(False)
         grid.addWidget(self.max_button, 3, 3)
+
+        invoice_error_icon = read_QIcon("warning.png")
+        self.invoice_error = IconLabel(reverse=True, hide_if_empty=True)
+        self.invoice_error.setIcon(invoice_error_icon)
+        grid.addWidget(self.invoice_error, 3, 4, Qt.AlignmentFlag.AlignRight)
 
         self.paste_button = QPushButton()
         self.paste_button.clicked.connect(self.do_paste)
@@ -267,7 +272,7 @@ class SendTab(QWidget, MessageBoxMixin, Logger):
                 tx = make_tx(0)
         except NotEnoughFunds as e:
             self.max_button.setChecked(False)
-            text = self.get_text_not_enough_funds_mentioning_frozen()
+            text = self.wallet.get_text_not_enough_funds_mentioning_frozen()
             self.show_error(text)
             return
 
@@ -283,7 +288,7 @@ class SendTab(QWidget, MessageBoxMixin, Logger):
         if x_fee_amount:
             twofactor_fee_str = self.format_amount_and_units(x_fee_amount)
             msg += "\n" + _("2fa fee: {} (for the next batch of transactions)").format(twofactor_fee_str)
-        frozen_bal = self.get_frozen_balance_str()
+        frozen_bal = self.wallet.get_frozen_balance_str()
         if frozen_bal:
             msg += "\n" + _("Some coins are frozen: {} (can be unfrozen in the Addresses or in the Coins tab)").format(frozen_bal)
         QToolTip.showText(self.max_button.mapToGlobal(QPoint(0, 0)), msg)
@@ -353,19 +358,6 @@ class SendTab(QWidget, MessageBoxMixin, Logger):
             callback=sign_done,
             external_keypairs=external_keypairs)
 
-    def get_text_not_enough_funds_mentioning_frozen(self) -> str:
-        text = _("Not enough funds")
-        frozen_str = self.get_frozen_balance_str()
-        if frozen_str:
-            text += " ({} {})".format(frozen_str, _("are frozen"))
-        return text
-
-    def get_frozen_balance_str(self) -> Optional[str]:
-        frozen_bal = sum(self.wallet.get_frozen_balance())
-        if not frozen_bal:
-            return None
-        return self.format_amount_and_units(frozen_bal)
-
     def do_clear(self):
         self.logger.debug('do_clear')
         self.lock_fields(lock_recipient=False, lock_amount=False, lock_max=True, lock_description=False)
@@ -380,6 +372,7 @@ class SendTab(QWidget, MessageBoxMixin, Logger):
             w.setEnabled(False)
         self.window.update_status()
         self.paytomany_menu.setChecked(self.payto_e.multiline)
+        self.invoice_error.setText('')
 
         run_hook('do_clear', self)
 
@@ -477,8 +470,10 @@ class SendTab(QWidget, MessageBoxMixin, Logger):
         amount_valid = is_spk_script or bool(self.amount_e.get_amount())
 
         self.send_button.setEnabled(not pi_unusable and amount_valid and not pi.has_expired())
-        self.save_button.setEnabled(not pi_unusable and not is_spk_script and \
+        self.save_button.setEnabled(not pi_unusable and not is_spk_script and not pi.has_expired() and \
                                     pi.type not in [PaymentIdentifierType.LNURLP, PaymentIdentifierType.LNADDR])
+
+        self.invoice_error.setText(_('Expired') if pi.has_expired() else '')
 
     def _handle_payment_identifier(self):
         self.update_fields()
