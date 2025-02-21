@@ -452,6 +452,9 @@ class PaymentFailure(UserFacingException): pass
 class NoPathFound(PaymentFailure):
     def __str__(self):
         return _('No path found')
+class FeeBudgetExceeded(PaymentFailure):
+    def __str__(self):
+        return _('Fee budget exceeded')
 
 
 class LNProtocolError(Exception):
@@ -1428,6 +1431,12 @@ class LnFeatures(IntFlag):
     _ln_feature_contexts[OPTION_SHUTDOWN_ANYSEGWIT_REQ] = (LNFC.INIT | LNFC.NODE_ANN)
     _ln_feature_contexts[OPTION_SHUTDOWN_ANYSEGWIT_OPT] = (LNFC.INIT | LNFC.NODE_ANN)
 
+    OPTION_ONION_MESSAGE_REQ = 1 << 38
+    OPTION_ONION_MESSAGE_OPT = 1 << 39
+
+    _ln_feature_contexts[OPTION_ONION_MESSAGE_REQ] = (LNFC.INIT | LNFC.NODE_ANN)
+    _ln_feature_contexts[OPTION_ONION_MESSAGE_OPT] = (LNFC.INIT | LNFC.NODE_ANN)
+
     OPTION_CHANNEL_TYPE_REQ = 1 << 44
     OPTION_CHANNEL_TYPE_OPT = 1 << 45
 
@@ -1465,28 +1474,28 @@ class LnFeatures(IntFlag):
 
     def for_init_message(self) -> 'LnFeatures':
         features = LnFeatures(0)
-        for flag in list_enabled_bits(self):
+        for flag in list_enabled_ln_feature_bits(self):
             if LnFeatureContexts.INIT & _ln_feature_contexts[1 << flag]:
                 features |= (1 << flag)
         return features
 
     def for_node_announcement(self) -> 'LnFeatures':
         features = LnFeatures(0)
-        for flag in list_enabled_bits(self):
+        for flag in list_enabled_ln_feature_bits(self):
             if LnFeatureContexts.NODE_ANN & _ln_feature_contexts[1 << flag]:
                 features |= (1 << flag)
         return features
 
     def for_invoice(self) -> 'LnFeatures':
         features = LnFeatures(0)
-        for flag in list_enabled_bits(self):
+        for flag in list_enabled_ln_feature_bits(self):
             if LnFeatureContexts.INVOICE & _ln_feature_contexts[1 << flag]:
                 features |= (1 << flag)
         return features
 
     def for_channel_announcement(self) -> 'LnFeatures':
         features = LnFeatures(0)
-        for flag in list_enabled_bits(self):
+        for flag in list_enabled_ln_feature_bits(self):
             ctxs = _ln_feature_contexts[1 << flag]
             if LnFeatureContexts.CHAN_ANN_AS_IS & ctxs:
                 features |= (1 << flag)
@@ -1623,6 +1632,19 @@ def get_ln_flag_pair_of_bit(flag_bit: int) -> int:
     else:
         return flag_bit - 1
 
+
+def list_enabled_ln_feature_bits(features: int) -> tuple[int, ...]:
+    """Returns a list of enabled feature bits. If both opt and req are set, only
+    req will be included in the result."""
+    all_enabled_bits = list_enabled_bits(features)
+    single_feature_bits: set[int] = set()
+    for bit in all_enabled_bits:
+        if bit % 2 == 0:  # even bit, always added
+            single_feature_bits.add(bit)
+        elif bit - 1 not in single_feature_bits:
+            # add if we haven't already added the corresponding req (even) bit
+            single_feature_bits.add(bit)
+    return tuple(sorted(single_feature_bits))
 
 
 class IncompatibleOrInsaneFeatures(Exception): pass
