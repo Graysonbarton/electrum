@@ -38,6 +38,8 @@ from .util import (
     make_aiohttp_session, timestamp_to_datetime, random_shuffled_copy, is_private_netaddress,
     UnrelatedTransactionException, LightningHistoryItem
 )
+from .fee_policy import FeePolicy, FixedFeePolicy
+from .fee_policy import FEERATE_FALLBACK_STATIC_FEE, FEE_LN_ETA_TARGET, FEE_LN_LOW_ETA_TARGET, FEERATE_PER_KW_MIN_RELAY_LIGHTNING
 from .invoices import Invoice, PR_UNPAID, PR_PAID, PR_INFLIGHT, PR_FAILED, LN_EXPIRY_NEVER, BaseInvoice
 from .bitcoin import COIN, opcodes, make_op_return, address_to_scripthash, DummyAddress
 from .bip32 import BIP32Node
@@ -60,7 +62,7 @@ from .lnutil import (
     LnKeyFamily, LOCAL, REMOTE, MIN_FINAL_CLTV_DELTA_FOR_INVOICE, SENT, RECEIVED, HTLCOwner, UpdateAddHtlc, LnFeatures,
     ShortChannelID, HtlcLog, NoPathFound, InvalidGossipMsg, FeeBudgetExceeded, ImportedChannelBackupStorage,
     OnchainChannelBackupStorage, ln_compare_features, IncompatibleLightningFeatures, PaymentFeeBudget,
-    NBLOCK_CLTV_DELTA_TOO_FAR_INTO_FUTURE
+    NBLOCK_CLTV_DELTA_TOO_FAR_INTO_FUTURE, GossipForwardingMessage
 )
 from .lnonion import decode_onion_error, OnionFailureCode, OnionRoutingFailure, OnionPacket
 from .lnmsg import decode_msg
@@ -162,7 +164,6 @@ LNWALLET_FEATURES = (
     BASE_FEATURES
     | LnFeatures.OPTION_DATA_LOSS_PROTECT_REQ
     | LnFeatures.OPTION_STATIC_REMOTEKEY_REQ
-    | LnFeatures.GOSSIP_QUERIES_REQ
     | LnFeatures.VAR_ONION_REQ
     | LnFeatures.PAYMENT_SECRET_REQ
     | LnFeatures.BASIC_MPP_OPT
@@ -175,8 +176,10 @@ LNWALLET_FEATURES = (
 
 LNGOSSIP_FEATURES = (
     BASE_FEATURES
-    | LnFeatures.GOSSIP_QUERIES_OPT
+    # LNGossip doesn't serve gossip but weirdly have to signal so
+    # that peers satisfy our queries
     | LnFeatures.GOSSIP_QUERIES_REQ
+    | LnFeatures.GOSSIP_QUERIES_OPT
 )
 
 
@@ -290,7 +293,7 @@ class LNWorker(Logger, EventListener, NetworkRetryManager[LNPeerAddr]):
         peer_addr = LNPeerAddr(host, port, node_id)
         self._trying_addr_now(peer_addr)
         self.logger.info(f"adding peer {peer_addr}")
-        if node_id == self.node_keypair.pubkey:
+        if node_id == self.node_keypair.pubkey or self.is_our_lnwallet(node_id):
             raise ErrorAddingPeer("cannot connect to self")
         transport = LNTransport(self.node_keypair.privkey, peer_addr,
                                 e_proxy=ESocksProxy.from_network_settings(self.network))
@@ -326,6 +329,14 @@ class LNWorker(Logger, EventListener, NetworkRetryManager[LNPeerAddr]):
 
     def num_peers(self) -> int:
         return sum([p.is_initialized() for p in self.peers.values()])
+
+    def is_our_lnwallet(self, node_id: bytes) -> bool:
+        """Check if node_id is one of our own wallets"""
+        wallets = self.network.daemon.get_wallets()
+        for wallet in wallets.values():
+            if wallet.lnworker and wallet.lnworker.node_keypair.pubkey == node_id:
+                return True
+        return False
 
     def start_network(self, network: 'Network'):
         assert network
@@ -511,6 +522,12 @@ class LNWorker(Logger, EventListener, NetworkRetryManager[LNPeerAddr]):
 
 
 class LNGossip(LNWorker):
+    """The LNGossip class is a separate, unannounced Lightning node with random id that is just querying
+    gossip from other nodes. The LNGossip node does not satisfy gossip queries, this is done by the
+    LNWallet class(es). LNWallets are the advertised nodes used for actual payments and only satisfy
+    peer queries without fetching gossip themselves. This separation is done so that gossip can be queried
+    independently of the active LNWallets. LNGossip keeps a curated batch of gossip in _forwarding_gossip
+    that is fetched by the LNWallets for regular forwarding."""
     max_age = 14*24*3600
     LOGGING_SHORTCUT = 'g'
 
@@ -521,12 +538,22 @@ class LNGossip(LNWorker):
         node_keypair = generate_keypair(BIP32Node.from_xkey(xprv), LnKeyFamily.NODE_KEY)
         LNWorker.__init__(self, node_keypair, LNGOSSIP_FEATURES, config=config)
         self.unknown_ids = set()
+        self._forwarding_gossip = []  # type: List[GossipForwardingMessage]
+        self._last_gossip_batch_ts = 0  # type: int
+        self._forwarding_gossip_lock = asyncio.Lock()
+        self.gossip_request_semaphore = asyncio.Semaphore(5)
+        # statistics
+        self._num_chan_ann = 0
+        self._num_node_ann = 0
+        self._num_chan_upd = 0
+        self._num_chan_upd_good = 0
 
     def start_network(self, network: 'Network'):
         super().start_network(network)
         for coro in [
                 self._maintain_connectivity(),
                 self.maintain_db(),
+                self._maintain_forwarding_gossip()
         ]:
             tg_coro = self.taskgroup.spawn(coro)
             asyncio.run_coroutine_threadsafe(tg_coro, self.network.asyncio_loop)
@@ -538,6 +565,20 @@ class LNGossip(LNWorker):
                 self.channel_db.prune_old_policies(self.max_age)
                 self.channel_db.prune_orphaned_channels()
             await asyncio.sleep(120)
+
+    async def _maintain_forwarding_gossip(self):
+        await self.channel_db.data_loaded.wait()
+        await self.wait_for_sync()
+        while True:
+            async with self._forwarding_gossip_lock:
+                self._forwarding_gossip = self.channel_db.get_forwarding_gossip_batch()
+                self._last_gossip_batch_ts = int(time.time())
+            self.logger.debug(f"{len(self._forwarding_gossip)} gossip messages available to forward")
+            await asyncio.sleep(60)
+
+    async def get_forwarding_gossip(self) -> tuple[List[GossipForwardingMessage], int]:
+        async with self._forwarding_gossip_lock:
+            return self._forwarding_gossip, self._last_gossip_batch_ts
 
     async def add_new_ids(self, ids: Iterable[bytes]):
         known = self.channel_db.get_channel_ids()
@@ -563,12 +604,19 @@ class LNGossip(LNWorker):
             return None, None, None
         nchans_with_0p, nchans_with_1p, nchans_with_2p = self.channel_db.get_num_channels_partitioned_by_policy_count()
         num_db_channels = nchans_with_0p + nchans_with_1p + nchans_with_2p
+        num_nodes = self.channel_db.num_nodes
+        num_nodes_associated_to_chans = max(len(self.channel_db._channels_for_node.keys()), 1)
         # some channels will never have two policies (only one is in gossip?...)
         # so if we have at least 1 policy for a channel, we consider that channel "complete" here
         current_est = num_db_channels - nchans_with_0p
         total_est = len(self.unknown_ids) + num_db_channels
 
-        progress = current_est / total_est if total_est and current_est else 0
+        progress_chans = current_est / total_est if total_est and current_est else 0
+        # consider that we got at least 10% of the node anns of node ids we know about
+        progress_nodes = min((num_nodes / num_nodes_associated_to_chans) * 10, 1)
+        progress = (progress_chans * 3 + progress_nodes) / 4  # weigh the channel progress higher
+        # self.logger.debug(f"Sync process chans: {progress_chans} | Progress nodes: {progress_nodes} | "
+        #                   f"Total progress: {progress} | NUM_NODES: {num_nodes} / {num_nodes_associated_to_chans}")
         progress_percent = (1.0 / 0.95 * progress) * 100
         progress_percent = min(progress_percent, 100)
         progress_percent = round(progress_percent)
@@ -582,7 +630,6 @@ class LNGossip(LNWorker):
         # note: we run in the originating peer's TaskGroup, so we can safely raise here
         #       and disconnect only from that peer
         await self.channel_db.data_loaded.wait()
-        self.logger.debug(f'process_gossip {len(chan_anns)} {len(node_anns)} {len(chan_upds)}')
 
         # channel announcements
         def process_chan_anns():
@@ -607,8 +654,29 @@ class LNGossip(LNWorker):
             self.logger.info(f'adding {len(orphaned)} unknown channel ids')
             orphaned_ids = [c['short_channel_id'] for c in orphaned]
             await self.add_new_ids(orphaned_ids)
-        if categorized_chan_upds.good:
-            self.logger.debug(f'process_gossip: {len(categorized_chan_upds.good)}/{len(chan_upds)}')
+
+        self._num_chan_ann += len(chan_anns)
+        self._num_node_ann += len(node_anns)
+        self._num_chan_upd += len(chan_upds)
+        self._num_chan_upd_good += len(categorized_chan_upds.good)
+
+    def is_synced(self) -> bool:
+        _, _, percentage_synced = self.get_sync_progress_estimate()
+        if percentage_synced is not None and percentage_synced >= 100:
+            return True
+        return False
+
+    async def wait_for_sync(self, times_to_check: int = 3):
+        """Check if we have 100% sync progress `times_to_check` times in a row (because the
+        estimate often jumps back after some seconds when doing initial sync)."""
+        while True:
+            if self.is_synced():
+                times_to_check -= 1
+                if times_to_check <= 0:
+                    return
+            await asyncio.sleep(10)
+            # flush the gossip queue so we don't forward old gossip after sync is complete
+            self.channel_db.get_forwarding_gossip_batch()
 
 
 class PaySession(Logger):
@@ -771,6 +839,8 @@ class LNWallet(LNWorker):
             features |= LnFeatures.OPTION_ANCHORS_ZERO_FEE_HTLC_OPT
         if self.config.ACCEPT_ZEROCONF_CHANNELS:
             features |= LnFeatures.OPTION_ZEROCONF_OPT
+        if self.config.EXPERIMENTAL_LN_FORWARD_PAYMENTS and self.config.LIGHTNING_USE_GOSSIP:
+            features |= LnFeatures.GOSSIP_QUERIES_OPT  # signal we have gossip to fetch
         LNWorker.__init__(self, self.node_keypair, features, config=self.config)
         self.lnwatcher = None
         self.lnrater: LNRater = None
@@ -812,6 +882,7 @@ class LNWallet(LNWorker):
         self.active_forwardings = self.db.get_dict('active_forwardings')    # type: Dict[str, List[str]]        # Dict: payment_key -> list of htlc_keys
         self.forwarding_failures = self.db.get_dict('forwarding_failures')  # type: Dict[str, Tuple[str, str]]  # Dict: payment_key -> (error_bytes, error_message)
         self.downstream_to_upstream_htlc = {}                               # type: Dict[str, str]              # Dict: htlc_key -> htlc_key (not persisted)
+        self.dont_settle_htlcs = self.db.get_dict('dont_settle_htlcs')      # type: Dict[str, None]             # payment_hashes of htlcs that we should not settle back yet even if we have the preimage
 
         # payment_hash -> callback:
         self.hold_invoice_callbacks = {}                # type: Dict[bytes, Callable[[bytes], Awaitable[None]]]
@@ -1056,7 +1127,7 @@ class LNWallet(LNWorker):
 
         # sanity check
         balance_msat = sum([x.amount_msat for x in out.values()])
-        lb = sum(chan.balance(LOCAL) if not chan.is_closed() else 0
+        lb = sum(chan.balance(LOCAL) if not chan.is_closed_or_closing() else 0
                 for chan in self.channels.values())
         assert balance_msat  == lb
         return out
@@ -1152,7 +1223,7 @@ class LNWallet(LNWorker):
                 self.logger.info('REBROADCASTING CLOSING TX')
                 await self.network.try_broadcasting(force_close_tx, 'force-close')
 
-    def get_peer_by_scid_alias(self, scid_alias: bytes) -> Optional[Peer]:
+    def get_peer_by_static_jit_scid_alias(self, scid_alias: bytes) -> Optional[Peer]:
         for nodeid, peer in self.peers.items():
             if scid_alias == self._scid_alias_of_node(nodeid):
                 return peer
@@ -1161,7 +1232,7 @@ class LNWallet(LNWorker):
         # scid alias for just-in-time channels
         return sha256(b'Electrum' + nodeid)[0:8]
 
-    def get_scid_alias(self) -> bytes:
+    def get_static_jit_scid_alias(self) -> bytes:
         return self._scid_alias_of_node(self.node_keypair.pubkey)
 
     @log_exceptions
@@ -1176,6 +1247,9 @@ class LNWallet(LNWorker):
     ) -> str:
         # if an exception is raised during negotiation, we raise an OnionRoutingFailure.
         # this will cancel the incoming HTLC
+
+        # prevent settling the htlc until the channel opening was successfull so we can fail it if needed
+        self.dont_settle_htlcs[payment_hash.hex()] = None
         try:
             funding_sat = 2 * (next_amount_msat_htlc // 1000) # try to fully spend htlcs
             password = self.wallet.get_unlocked_password() if self.wallet.has_password() else None
@@ -1210,13 +1284,17 @@ class LNWallet(LNWorker):
                 while self.get_preimage(payment_hash) is None:
                     await asyncio.sleep(1)
             await util.wait_for2(wait_for_preimage(), LN_P2P_NETWORK_TIMEOUT)
+
+            # We have been paid and can broadcast
+            # todo: if broadcasting raise an exception, we should try to rebroadcast
+            await self.network.broadcast_transaction(funding_tx)
         except OnionRoutingFailure:
             raise
         except Exception:
             raise OnionRoutingFailure(code=OnionFailureCode.TEMPORARY_NODE_FAILURE, data=b'')
-        # We have been paid and can broadcast
-        # todo: if broadcasting raise an exception, we should try to rebroadcast
-        await self.network.broadcast_transaction(funding_tx)
+        finally:
+            del self.dont_settle_htlcs[payment_hash.hex()]
+
         htlc_key = serialize_htlc_key(next_chan.get_scid_or_local_alias(), htlc.htlc_id)
         return htlc_key
 
@@ -1232,11 +1310,12 @@ class LNWallet(LNWorker):
             self.wallet.unlock(password)
         coins = self.wallet.get_spendable_coins(None)
         node_id = peer.pubkey
+        fee_policy = FeePolicy(self.config.FEE_POLICY)
         funding_tx = self.mktx_for_open_channel(
             coins=coins,
             funding_sat=funding_sat,
             node_id=node_id,
-            fee_est=None)
+            fee_policy=fee_policy)
         chan, funding_tx = await self._open_channel_coroutine(
             peer=peer,
             funding_tx=funding_tx,
@@ -1319,7 +1398,8 @@ class LNWallet(LNWorker):
             coins: Sequence[PartialTxInput],
             funding_sat: int,
             node_id: bytes,
-            fee_est=None) -> PartialTransaction:
+            fee_policy: FeePolicy,
+    ) -> PartialTransaction:
         from .wallet import get_locktime_for_new_transaction
 
         outputs = [PartialTxOutput.from_address_and_value(DummyAddress.CHANNEL, funding_sat)]
@@ -1329,7 +1409,7 @@ class LNWallet(LNWorker):
         tx = self.wallet.make_unsigned_transaction(
             coins=coins,
             outputs=outputs,
-            fee=fee_est)
+            fee_policy=fee_policy)
         tx.set_rbf(False)
         # rm randomness from locktime, as we use the locktime as entropy for deriving the funding_privkey
         # (and it would be confusing to get a collision as a consequence of the randomness)
@@ -1345,16 +1425,16 @@ class LNWallet(LNWorker):
         min_funding_sat = max(min_funding_sat, 100_000) # at least 1mBTC
         if min_funding_sat > self.config.LIGHTNING_MAX_FUNDING_SAT:
             return
-        fee_est = partial(self.config.estimate_fee, allow_fallback_to_static_rates=True)  # to avoid NoDynamicFeeEstimates
+        fee_policy = FeePolicy(f'feerate:{FEERATE_FALLBACK_STATIC_FEE}')
         try:
-            self.mktx_for_open_channel(coins=coins, funding_sat=min_funding_sat, node_id=bytes(32), fee_est=fee_est)
+            self.mktx_for_open_channel(coins=coins, funding_sat=min_funding_sat, node_id=bytes(32), fee_policy=fee_policy)
             funding_sat = min_funding_sat
         except NotEnoughFunds:
             return
         # if available, suggest twice that amount:
         if 2 * min_funding_sat <= self.config.LIGHTNING_MAX_FUNDING_SAT:
             try:
-                self.mktx_for_open_channel(coins=coins, funding_sat=2*min_funding_sat, node_id=bytes(32), fee_est=fee_est)
+                self.mktx_for_open_channel(coins=coins, funding_sat=2*min_funding_sat, node_id=bytes(32), fee_policy=fee_policy)
                 funding_sat = 2 * min_funding_sat
             except NotEnoughFunds:
                 pass
@@ -2112,11 +2192,15 @@ class LNWallet(LNWorker):
 
         assert amount_msat is None or amount_msat > 0
         timestamp = int(time.time())
-        routing_hints = self.calc_routing_hints_for_invoice(amount_msat, channels=channels)
-        self.logger.info(f"creating bolt11 invoice with routing_hints: {routing_hints}")
+        needs_jit: bool = self.receive_requires_jit_channel(amount_msat)
+        routing_hints = self.calc_routing_hints_for_invoice(amount_msat, channels=channels, needs_jit=needs_jit)
+        self.logger.info(f"creating bolt11 invoice with routing_hints: {routing_hints}, jit: {needs_jit}")
         invoice_features = self.features.for_invoice()
         if not self.uses_trampoline():
             invoice_features &= ~ LnFeatures.OPTION_TRAMPOLINE_ROUTING_OPT_ELECTRUM
+        if needs_jit:
+            # jit only works with single htlcs, mpp will cause LSP to open channels for each htlc
+            invoice_features &= ~ LnFeatures.BASIC_MPP_OPT & ~ LnFeatures.BASIC_MPP_REQ
         payment_secret = self.get_payment_secret(payment_hash)
         amount_btc = amount_msat/Decimal(COIN*1000) if amount_msat else None
         if expiry == 0:
@@ -2505,14 +2589,14 @@ class LNWallet(LNWorker):
             else:
                 self.logger.info(f"waiting for other htlcs to fail (phash={payment_hash.hex()})")
 
-    def calc_routing_hints_for_invoice(self, amount_msat: Optional[int], channels=None):
+    def calc_routing_hints_for_invoice(self, amount_msat: Optional[int], channels=None, needs_jit=False):
         """calculate routing hints (BOLT-11 'r' field)"""
         routing_hints = []
-        if self.config.ZEROCONF_TRUSTED_NODE:
+        if needs_jit:
             node_id, rest = extract_nodeid(self.config.ZEROCONF_TRUSTED_NODE)
-            alias_or_scid = self.get_scid_alias()
+            alias_or_scid = self.get_static_jit_scid_alias()
             routing_hints.append(('r', [(node_id, alias_or_scid, 0, 0, 144)]))
-            # no need for more
+            # no need for more because we cannot receive enough through the others and mpp is disabled for jit
             channels = []
         else:
             if channels is None:
@@ -2664,6 +2748,21 @@ class LNWallet(LNWorker):
             return Decimal(0)
         can_receive_msat = max(recv_chan_msats)
         return Decimal(can_receive_msat) / 1000
+
+    def receive_requires_jit_channel(self, amount_msat: Optional[int]) -> bool:
+        """Returns true if we cannot receive the amount and have set up a trusted LSP node.
+        Cannot work reliably with 0 amount invoices as we don't know if we are able to receive it.
+        """
+        # a trusted zeroconf node is configured
+        if (self.config.ZEROCONF_TRUSTED_NODE
+                # the zeroconf node is a peer, it doesn't make sense to request a channel from an offline LSP
+                and extract_nodeid(self.config.ZEROCONF_TRUSTED_NODE)[0] in self.peers
+                # we cannot receive the amount specified
+                and ((amount_msat and self.num_sats_can_receive() < (amount_msat // 1000))
+                    # or we cannot receive anything, and it's a 0 amount invoice
+                    or (not amount_msat and self.num_sats_can_receive() < 1))):
+            return True
+        return False
 
     def _suggest_channels_for_rebalance(self, direction, amount_sat) -> Sequence[Tuple[Channel, int]]:
         """
@@ -2879,23 +2978,17 @@ class LNWallet(LNWorker):
                     await self.taskgroup.spawn(self.reestablish_peer_for_given_channel(chan))
 
     def current_target_feerate_per_kw(self) -> int:
-        from .simple_config import FEE_LN_ETA_TARGET, FEERATE_FALLBACK_STATIC_FEE
-        from .simple_config import FEERATE_PER_KW_MIN_RELAY_LIGHTNING
-        if constants.net is constants.BitcoinRegtest:
-            feerate_per_kvbyte = self.network.config.FEE_EST_STATIC_FEERATE
+        if self.network.fee_estimates.has_data():
+            feerate_per_kvbyte = self.network.fee_estimates.eta_target_to_fee(FEE_LN_ETA_TARGET)
         else:
-            feerate_per_kvbyte = self.network.config.eta_target_to_fee(FEE_LN_ETA_TARGET)
-            if feerate_per_kvbyte is None:
-                feerate_per_kvbyte = FEERATE_FALLBACK_STATIC_FEE
+            feerate_per_kvbyte = FEERATE_FALLBACK_STATIC_FEE
         return max(FEERATE_PER_KW_MIN_RELAY_LIGHTNING, feerate_per_kvbyte // 4)
 
     def current_low_feerate_per_kw(self) -> int:
-        from .simple_config import FEE_LN_LOW_ETA_TARGET
-        from .simple_config import FEERATE_PER_KW_MIN_RELAY_LIGHTNING
         if constants.net is constants.BitcoinRegtest:
             feerate_per_kvbyte = 0
         else:
-            feerate_per_kvbyte = self.network.config.eta_target_to_fee(FEE_LN_LOW_ETA_TARGET) or 0
+            feerate_per_kvbyte = self.network.fee_estimates.eta_target_to_fee(FEE_LN_LOW_ETA_TARGET) or 0
         low_feerate_per_kw = max(FEERATE_PER_KW_MIN_RELAY_LIGHTNING, feerate_per_kvbyte // 4)
         # make sure this is never higher than the target feerate:
         low_feerate_per_kw = min(low_feerate_per_kw, self.current_target_feerate_per_kw())

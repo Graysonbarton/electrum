@@ -41,6 +41,7 @@ import binascii
 import copy
 
 import electrum_ecc as ecc
+from electrum_ecc.util import bip340_tagged_hash
 
 from . import bitcoin, constants, segwit_addr, bip32
 from .bip32 import BIP32Node
@@ -1246,8 +1247,13 @@ class Transaction:
     def get_change_outputs(self):
         return  [o for o in self._outputs if o.is_change]
 
-    def has_dummy_output(self, dummy_addr: str) -> bool:
-        return len(self.get_output_idxs_from_address(dummy_addr)) == 1
+    def get_dummy_output(self, dummy_addr: str) -> Optional['PartialTxOutput']:
+        idxs = self.get_output_idxs_from_address(dummy_addr)
+        if not idxs:
+            return
+        assert len(idxs) == 1
+        for i in idxs:
+            return self.outputs()[i]
 
     def output_value_for_address(self, addr):
         # assumes exactly one output has that address
@@ -2319,7 +2325,7 @@ class PartialTransaction(Transaction):
             merkle_root = txin.tap_merkle_root or bytes()
             output_privkey_bytes = taproot_tweak_seckey(privkey_bytes, merkle_root)
             output_privkey = ecc.ECPrivkey(output_privkey_bytes)
-            msg_hash = bitcoin.bip340_tagged_hash(b"TapSighash", pre_hash)
+            msg_hash = bip340_tagged_hash(b"TapSighash", pre_hash)
             sig = output_privkey.schnorr_sign(msg_hash)
             sighash = txin.sighash if txin.sighash is not None else Sighash.DEFAULT
         else:

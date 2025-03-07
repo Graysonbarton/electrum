@@ -9,9 +9,11 @@ from collections import namedtuple, defaultdict
 from typing import NamedTuple, List, Tuple, Mapping, Optional, TYPE_CHECKING, Union, Dict, Set, Sequence
 import re
 import sys
+import time
 
 import electrum_ecc as ecc
 from electrum_ecc import CURVE_ORDER, ecdsa_sig64_from_der_sig, ECPubkey, string_to_number
+from electrum_ecc.util import bip340_tagged_hash
 import attr
 
 from .util import bfh, inv_dict, UserFacingException
@@ -32,6 +34,7 @@ from .lnaddr import lndecode
 from .bip32 import BIP32Node, BIP32_PRIME
 from .transaction import BCDataStream, OPPushDataGeneric
 from .logging import get_logger
+from .fee_policy import FEERATE_PER_KW_MIN_RELAY_LIGHTNING
 
 
 if TYPE_CHECKING:
@@ -204,7 +207,6 @@ class ChannelConfig(StoredObject):
             raise Exception(
                 "both to_local and to_remote amounts for the initial commitment "
                 "transaction are less than or equal to channel_reserve_satoshis")
-        from .simple_config import FEERATE_PER_KW_MIN_RELAY_LIGHTNING
         if initial_feerate_per_kw < FEERATE_PER_KW_MIN_RELAY_LIGHTNING:
             raise Exception(f"feerate lower than min relay fee. {initial_feerate_per_kw} sat/kw.")
 
@@ -501,6 +503,9 @@ NBLOCK_CLTV_DELTA_TOO_FAR_INTO_FUTURE = 28 * 144
 
 MAXIMUM_REMOTE_TO_SELF_DELAY_ACCEPTED = 2016
 
+# timeout after which we consider a zeroconf channel without funding tx to be failed
+ZEROCONF_TIMEOUT = 60 * 10
+
 class RevocationStore:
     # closely based on code in lightningnetwork/lnd
 
@@ -641,7 +646,7 @@ def derive_multisig_funding_key_if_we_opened(
     assert isinstance(nlocktime, int)
     nlocktime_bytes = int.to_bytes(nlocktime, length=4, byteorder="little", signed=False)
     node_id_prefix = remote_node_id_or_prefix[0:NODE_ID_PREFIX_LEN]
-    funding_key = ecc.ECPrivkey(bitcoin.bip340_tagged_hash(
+    funding_key = ecc.ECPrivkey(bip340_tagged_hash(
         tag=b"electrum/ln_multisig_funding_key/we_opened",
         msg=funding_root_secret + node_id_prefix + nlocktime_bytes,
     ))
@@ -665,7 +670,7 @@ def derive_multisig_funding_key_if_they_opened(
     assert isinstance(remote_funding_pubkey, bytes)
     assert len(remote_funding_pubkey) == 33
     node_id_prefix = remote_node_id_or_prefix[0:NODE_ID_PREFIX_LEN]
-    funding_key = ecc.ECPrivkey(bitcoin.bip340_tagged_hash(
+    funding_key = ecc.ECPrivkey(bip340_tagged_hash(
         tag=b"electrum/ln_multisig_funding_key/they_opened",
         msg=funding_root_secret + node_id_prefix + remote_funding_pubkey,
     ))
@@ -1508,6 +1513,10 @@ class LnFeatures(IntFlag):
                 features |= (1 << flag)
         return features
 
+    def min_len(self) -> int:
+        b = int.bit_length(self)
+        return b // 8 + int(bool(b % 8))
+
     def supports(self, feature: 'LnFeatures') -> bool:
         """Returns whether given feature is enabled.
 
@@ -1632,6 +1641,56 @@ def get_ln_flag_pair_of_bit(flag_bit: int) -> int:
     else:
         return flag_bit - 1
 
+
+class GossipTimestampFilter:
+    def __init__(self, first_timestamp: int, timestamp_range: int):
+        self.first_timestamp = first_timestamp
+        self.timestamp_range = timestamp_range
+        # True once we sent them the requested gossip and only forward
+        self.only_forwarding = False
+        if first_timestamp >= int(time.time()) - 20:
+            self.only_forwarding = True
+
+    def __str__(self):
+        return (f"GossipTimestampFilter | first_timestamp={self.first_timestamp} | "
+                f"timestamp_range={self.timestamp_range}")
+
+    def in_range(self, timestamp: int) -> bool:
+        return self.first_timestamp <= timestamp < self.first_timestamp + self.timestamp_range
+
+    @classmethod
+    def from_payload(cls, payload) -> Optional['GossipTimestampFilter']:
+        try:
+            first_timestamp = payload['first_timestamp']
+            timestamp_range = payload['timestamp_range']
+        except KeyError:
+            return None
+        if first_timestamp >= 0xFFFFFFFF:
+            return None
+        return cls(first_timestamp, timestamp_range)
+
+
+class GossipForwardingMessage:
+    def __init__(self,
+                 msg: bytes,
+                 scid: Optional[ShortChannelID] = None,
+                 timestamp: Optional[int] = None,
+                 sender_node_id: Optional[bytes] = None):
+        self.scid: Optional[ShortChannelID] = scid
+        self.sender_node_id: Optional[bytes] = sender_node_id
+        self.msg = msg
+        self.timestamp = timestamp
+
+    @classmethod
+    def from_payload(cls, payload: dict) -> Optional['GossipForwardingMessage']:
+        try:
+            msg = payload['raw']
+            scid = ShortChannelID.normalize(payload.get('short_channel_id'))
+            sender_node_id = payload.get('sender_node_id')
+            timestamp = payload.get('timestamp')
+        except KeyError:
+            return None
+        return cls(msg, scid, timestamp, sender_node_id)
 
 def list_enabled_ln_feature_bits(features: int) -> tuple[int, ...]:
     """Returns a list of enabled feature bits. If both opt and req are set, only
