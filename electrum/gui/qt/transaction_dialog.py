@@ -28,7 +28,7 @@ import concurrent.futures
 import copy
 import datetime
 import time
-from typing import TYPE_CHECKING, Optional, List, Union, Mapping
+from typing import TYPE_CHECKING, Optional, List, Union, Mapping, Callable
 from functools import partial
 from decimal import Decimal
 
@@ -47,7 +47,7 @@ from electrum.i18n import _
 from electrum.plugin import run_hook
 from electrum.transaction import SerializationError, Transaction, PartialTransaction, TxOutpoint, TxinDataFetchProgress
 from electrum.logging import get_logger
-from electrum.util import ShortID, get_asyncio_loop, UI_UNIT_NAME_TXSIZE_VBYTES
+from electrum.util import ShortID, get_asyncio_loop, UI_UNIT_NAME_TXSIZE_VBYTES, delta_time_str
 from electrum.network import Network
 from electrum.wallet import TxSighashRiskLevel, TxSighashDanger
 
@@ -57,14 +57,14 @@ from .util import (MessageBoxMixin, read_QIcon, Buttons, icon_path,
                    TRANSACTION_FILE_EXTENSION_FILTER_ONLY_COMPLETE_TX,
                    TRANSACTION_FILE_EXTENSION_FILTER_ONLY_PARTIAL_TX,
                    getSaveFileName, ColorSchemeItem,
-                   get_iconname_qrcode, VLine, WaitingDialog)
+                   get_icon_qrcode, VLine, WaitingDialog)
 from .rate_limiter import rate_limited
 from .my_treeview import create_toolbar_with_menu, QMenuWithConfig
 
 if TYPE_CHECKING:
     from .main_window import ElectrumWindow
     from electrum.wallet import Abstract_Wallet
-    from electrum.payment_identifier import PaymentIdentifier
+    from electrum.invoices import Invoice
 
 
 _logger = get_logger(__name__)
@@ -285,8 +285,16 @@ class TxInOutWidget(QWidget):
             else:
                 short_id = f"unknown:{txout_idx}"
             addr = o.get_ui_address_str()
+            spender_txid = None  # type: Optional[str]
+            if tx_hash:
+                spender_txid = self.wallet.db.get_spent_outpoint(tx_hash, txout_idx)
+            tcf_shortid = None
+            if spender_txid:
+                tcf_shortid = QTextCharFormat(lnk)
+                tcf_shortid.setAnchorHref(spender_txid)
             insert_tx_io(
                 cursor=cursor, is_coinbase=False, txio_idx=txout_idx,
+                tcf_shortid=tcf_shortid,
                 short_id=str(short_id), addr=addr, value=o.value,
             )
 
@@ -397,6 +405,7 @@ class TxInOutWidget(QWidget):
         for item in copy_list:
             menu.addAction(*item)
 
+        run_hook('transaction_dialog_address_menu', menu, addr, self.wallet)
         menu.addSeparator()
         std_menu = o_text.createStandardContextMenu()
         menu.addActions(std_menu.actions())
@@ -409,7 +418,10 @@ def show_transaction(
     parent: 'ElectrumWindow',
     prompt_if_unsaved: bool = False,
     external_keypairs: Mapping[bytes, bytes] = None,
-    payment_identifier: 'PaymentIdentifier' = None,
+    invoice: 'Invoice' = None,
+    on_closed: Callable[[], None] = None,
+    show_sign_button: bool = True,
+    show_broadcast_button: bool = True,
 ):
     try:
         d = TxDialog(
@@ -417,8 +429,13 @@ def show_transaction(
             parent=parent,
             prompt_if_unsaved=prompt_if_unsaved,
             external_keypairs=external_keypairs,
-            payment_identifier=payment_identifier,
+            invoice=invoice,
+            on_closed=on_closed,
         )
+        if not show_sign_button:
+            d.sign_button.setVisible(False)
+        if not show_broadcast_button:
+            d.broadcast_button.setVisible(False)
     except SerializationError as e:
         _logger.exception('unable to deserialize the transaction')
         parent.show_critical(_("Electrum was unable to deserialize the transaction:") + "\n" + str(e))
@@ -437,7 +454,8 @@ class TxDialog(QDialog, MessageBoxMixin):
         parent: 'ElectrumWindow',
         prompt_if_unsaved: bool,
         external_keypairs: Mapping[bytes, bytes] = None,
-        payment_identifier: 'PaymentIdentifier' = None,
+        invoice: 'Invoice' = None,
+        on_closed: Callable[[], None] = None,
     ):
         '''Transactions in the wallet will show their description.
         Pass desc to give a description for txs not yet in the wallet.
@@ -449,12 +467,15 @@ class TxDialog(QDialog, MessageBoxMixin):
         self.main_window = parent
         self.config = parent.config
         self.wallet = parent.wallet
-        self.payment_identifier = payment_identifier
+        self.invoice = invoice
         self.prompt_if_unsaved = prompt_if_unsaved
+        self.on_closed = on_closed
         self.saved = False
         self.desc = None
         if txid := tx.txid():
             self.desc = self.wallet.get_label_for_txid(txid) or None
+        if not self.desc and self.invoice:
+            self.desc = self.invoice.get_message()
         self.setMinimumWidth(640)
 
         self.psbt_only_widgets = []  # type: List[Union[QWidget, QAction]]
@@ -473,13 +494,8 @@ class TxDialog(QDialog, MessageBoxMixin):
         self.tx_desc_label = QLabel(_("Description:"))
         vbox.addWidget(self.tx_desc_label)
         self.tx_desc = ButtonsLineEdit('')
-        def on_edited():
-            text = self.tx_desc.text()
-            if self.wallet.set_label(txid, text):
-                self.main_window.history_list.update()
-                self.main_window.utxo_list.update()
-                self.main_window.labels_changed_signal.emit()
-        self.tx_desc.editingFinished.connect(on_edited)
+
+        self.tx_desc.editingFinished.connect(self.store_tx_label)
         self.tx_desc.addCopyButton()
         vbox.addWidget(self.tx_desc)
 
@@ -560,6 +576,13 @@ class TxDialog(QDialog, MessageBoxMixin):
         self.update()
         self.set_title()
 
+    def store_tx_label(self):
+        text = self.tx_desc.text()
+        if self.wallet.set_label(self.tx.txid(), text):
+            self.main_window.history_list.update()
+            self.main_window.utxo_list.update()
+            self.main_window.labels_changed_signal.emit()
+
     def set_tx(self, tx: 'Transaction'):
         # Take a copy; it might get updated in the main window by
         # e.g. the FX plugin.  If this happens during or after a long
@@ -588,7 +611,7 @@ class TxDialog(QDialog, MessageBoxMixin):
         self.main_window.push_top_level_window(self)
         self.main_window.send_tab.save_pending_invoice()
         try:
-            self.main_window.broadcast_transaction(self.tx, payment_identifier=self.payment_identifier)
+            self.main_window.broadcast_transaction(self.tx, invoice=self.invoice)
         finally:
             self.main_window.pop_top_level_window(self)
         self.saved = True
@@ -607,6 +630,9 @@ class TxDialog(QDialog, MessageBoxMixin):
         if self._fetch_txin_data_fut:
             self._fetch_txin_data_fut.cancel()
             self._fetch_txin_data_fut = None
+
+        if self.on_closed:
+            self.on_closed()
 
     def reject(self):
         # Override escape-key to close normally (and invoke closeEvent)
@@ -628,7 +654,7 @@ class TxDialog(QDialog, MessageBoxMixin):
         action.triggered.connect(lambda: self.copy_to_clipboard(tx=gettx()))
         menu.addAction(action)
 
-        action = QAction(read_QIcon(get_iconname_qrcode()), _("Show as QR code"), self)
+        action = QAction(get_icon_qrcode(), _("Show as QR code"), self)
         action.triggered.connect(lambda: self.show_qr(tx=gettx()))
         menu.addAction(action)
 
@@ -700,6 +726,7 @@ class TxDialog(QDialog, MessageBoxMixin):
     def save(self):
         self.main_window.push_top_level_window(self)
         if self.main_window.save_transaction_into_wallet(self.tx):
+            self.store_tx_label()
             self.save_button.setDisabled(True)
             self.saved = True
         self.main_window.pop_top_level_window(self)
@@ -809,7 +836,7 @@ class TxDialog(QDialog, MessageBoxMixin):
             tx_item_fiat = self.wallet.get_tx_item_fiat(
                 tx_hash=txid, amount_sat=abs(amount), fx=fx, tx_fee=fee)
 
-        if self.wallet.lnworker:
+        if self.wallet.lnworker and txid:
             # if it is a group, collect ln amount
             full_history = self.wallet.get_full_history()
             item = full_history.get('group:' + txid)
@@ -829,7 +856,8 @@ class TxDialog(QDialog, MessageBoxMixin):
             # note: when not finalized, RBF and locktime changes do not trigger
             #       a make_tx, so the txid is unreliable, hence:
             self.tx_hash_e.setText(_('Unknown'))
-        if not self.wallet.adb.get_transaction(txid):
+        tx_in_db = bool(self.wallet.adb.get_transaction(txid))
+        if not desc and not tx_in_db:
             self.tx_desc.hide()
             self.tx_desc_label.hide()
         else:
@@ -843,7 +871,8 @@ class TxDialog(QDialog, MessageBoxMixin):
             self.date_label.setText(_("Date: {}").format(time_str))
             self.date_label.show()
         elif exp_n is not None:
-            self.date_label.setText(_('Position in mempool: {}').format(self.config.depth_tooltip(exp_n)))
+            from electrum.fee_policy import FeePolicy
+            self.date_label.setText(_('Position in mempool: {}').format(FeePolicy.depth_tooltip(exp_n)))
             self.date_label.show()
         else:
             self.date_label.hide()
@@ -853,6 +882,19 @@ class TxDialog(QDialog, MessageBoxMixin):
             locktime_str = datetime.datetime.fromtimestamp(self.tx.locktime)
         locktime_final_str = _("LockTime: {} ({})").format(self.tx.locktime, locktime_str)
         self.locktime_final_label.setText(locktime_final_str)
+
+        nsequence_time = self.tx.get_time_based_relative_locktime()
+        nsequence_blocks = self.tx.get_block_based_relative_locktime()
+        if nsequence_time or nsequence_blocks:
+            if nsequence_time:
+                seconds = nsequence_time * 512
+                time_str = delta_time_str(datetime.timedelta(seconds=seconds))
+            else:
+                time_str = '{} blocks'.format(nsequence_blocks)
+            nsequence_str = _("Relative locktime: {}").format(time_str)
+            self.nsequence_label.setText(nsequence_str)
+        else:
+            self.nsequence_label.hide()
 
         # TODO: 'Yes'/'No' might be better translatable than 'True'/'False'?
         self.rbf_label.setText(_('Replace by fee: {}').format(_('True') if self.tx.is_rbf_enabled() else _('False')))
@@ -904,7 +946,7 @@ class TxDialog(QDialog, MessageBoxMixin):
                 # 'amount' is zero for self-payments, so in that case we use sum-of-outputs
                 invoice_amt = abs(amount) if amount else self.tx.output_value()
                 fee_warning_tuple = self.wallet.get_tx_fee_warning(
-                    invoice_amt=invoice_amt, tx_size=size, fee=fee)
+                    invoice_amt=invoice_amt, tx_size=size, fee=fee, txid=self.tx.txid())
                 if fee_warning_tuple:
                     allow_send, long_warning, short_warning = fee_warning_tuple
                     fee_str += " - <font color={color}>{header}: {body}</font>".format(
@@ -992,6 +1034,9 @@ class TxDialog(QDialog, MessageBoxMixin):
 
         self.locktime_final_label = TxDetailLabel()
         vbox_right.addWidget(self.locktime_final_label)
+
+        self.nsequence_label = TxDetailLabel()
+        vbox_right.addWidget(self.nsequence_label)
 
         self.block_height_label = TxDetailLabel()
         vbox_right.addWidget(self.block_height_label)

@@ -2,7 +2,7 @@ import asyncio
 import concurrent
 import threading
 from enum import IntEnum
-from typing import Union, Optional
+from typing import Union, Optional, TYPE_CHECKING, Sequence
 
 from PyQt6.QtCore import (pyqtProperty, pyqtSignal, pyqtSlot, QObject, QTimer, pyqtEnum, QAbstractListModel, Qt,
                           QModelIndex)
@@ -13,6 +13,7 @@ from electrum.logging import get_logger
 from electrum.transaction import PartialTxOutput, PartialTransaction
 from electrum.util import NotEnoughFunds, NoDynamicFeeEstimates, profiler, get_asyncio_loop, age
 from electrum.submarine_swaps import NostrTransport, SwapServerTransport
+from electrum.fee_policy import FeePolicy
 
 from electrum.gui import messages
 
@@ -20,6 +21,9 @@ from .auth import AuthMixin, auth_protect
 from .qetypes import QEAmount
 from .qewallet import QEWallet
 from .util import QtEventListener, qt_event_listener
+
+if TYPE_CHECKING:
+    from electrum.submarine_swaps import SwapOffer
 
 
 class InvalidSwapParameters(Exception): pass
@@ -29,7 +33,7 @@ class QESwapServerNPubListModel(QAbstractListModel):
     _logger = get_logger(__name__)
 
     # define listmodel rolemap
-    _ROLE_NAMES= ('npub', 'timestamp', 'percentage_fee', 'mining_fee', 'min_amount', 'max_amount')
+    _ROLE_NAMES= ('npub', 'timestamp', 'percentage_fee', 'mining_fee', 'min_amount', 'max_forward_amount', 'max_reverse_amount')
     _ROLE_KEYS = range(Qt.ItemDataRole.UserRole, Qt.ItemDataRole.UserRole + len(_ROLE_NAMES))
     _ROLE_MAP  = dict(zip(_ROLE_KEYS, [bytearray(x.encode()) for x in _ROLE_NAMES]))
 
@@ -63,15 +67,16 @@ class QESwapServerNPubListModel(QAbstractListModel):
         self._services = []
         self.endResetModel()
 
-    def initModel(self, items):
+    def initModel(self, items: Sequence['SwapOffer']):
         self.beginInsertRows(QModelIndex(), len(items), len(items))
         self._services = [{
-            'npub': x['pubkey'],
-            'percentage_fee': x['percentage_fee'],
-            'mining_fee': x['mining_fee'],
-            'min_amount': x['min_amount'],
-            'max_amount': x['max_amount'],
-            'timestamp': age(x['timestamp']),
+            'npub': x.server_npub,
+            'percentage_fee': x.pairs.percentage,
+            'mining_fee': x.pairs.mining_fee,
+            'min_amount': x.pairs.min_amount,
+            'max_forward_amount': x.pairs.max_forward,
+            'max_reverse_amount': x.pairs.max_reverse,
+            'timestamp': age(x.timestamp),
         } for x in items]
         self.endInsertRows()
         self.countChanged.emit()
@@ -429,12 +434,12 @@ class QESwapHelper(AuthMixin, QObject, QtEventListener):
         except AttributeError:  # happens if there are no utxos
             max_onchain_spend = 0
         reverse = int(min(lnworker.num_sats_can_send(),
-                          swap_manager.get_max_amount()))
-        max_recv_amt_ln = min(swap_manager.get_max_amount(), int(lnworker.num_sats_can_receive()))
+                          swap_manager.get_provider_max_forward_amount()))
+        max_recv_amt_ln = min(swap_manager.get_provider_max_reverse_amount(), int(lnworker.num_sats_can_receive()))
         max_recv_amt_oc = swap_manager.get_send_amount(max_recv_amt_ln, is_reverse=False) or 0
         forward = int(min(max_recv_amt_oc,
                           # maximally supported swap amount by provider
-                          swap_manager.get_max_amount(),
+                          swap_manager.get_provider_max_reverse_amount(),
                           max_onchain_spend))
         # we expect range to adjust the value of the swap slider to be in the
         # correct range, i.e., to correct an overflow when reducing the limits
@@ -465,10 +470,12 @@ class QESwapHelper(AuthMixin, QObject, QtEventListener):
             return
         outputs = [PartialTxOutput.from_address_and_value(DummyAddress.SWAP, onchain_amount)]
         coins = self._wallet.wallet.get_spendable_coins(None)
+        fee_policy = FeePolicy(self._wallet.wallet.config.FEE_POLICY)
         try:
             self._tx = self._wallet.wallet.make_unsigned_transaction(
                 coins=coins,
-                outputs=outputs)
+                outputs=outputs,
+                fee_policy=fee_policy)
         except (NotEnoughFunds, NoDynamicFeeEstimates):
             self._tx = None
             self.valid = False
@@ -501,6 +508,7 @@ class QESwapHelper(AuthMixin, QObject, QtEventListener):
         server_miningfee = swap_manager.mining_fee
         self.serverMiningfee = QEAmount(amount_sat=server_miningfee)
         if self.isReverse:
+            self.miningfee = QEAmount(amount_sat=swap_manager.get_swap_tx_fee())
             self.check_valid(self._send_amount, self._receive_amount)
         else:
             # update tx only if slider isn't moved for a while
@@ -519,6 +527,9 @@ class QESwapHelper(AuthMixin, QObject, QtEventListener):
             self.valid = False
 
     def fwd_swap_updatetx(self):
+        # if slider is on reverse swap side when timer hits, ignore
+        if self.isReverse:
+            return
         self.update_tx(self._send_amount)
         # add lockup fees, but the swap amount is position
         pay_amount = self._send_amount + self._tx.get_fee() if self._tx else 0
@@ -553,10 +564,7 @@ class QESwapHelper(AuthMixin, QObject, QtEventListener):
                     txid = fut.result()
                     try:  # swaphelper might be destroyed at this point
                         if txid:
-                            self.userinfo = ' '.join([
-                                _('Success!'),
-                                messages.MSG_FORWARD_SWAP_FUNDING_MEMPOOL,
-                            ])
+                            self.userinfo = _('Success!')
                             self.state = QESwapHelper.State.Success
                         else:
                             self.userinfo = _('Swap failed!')
@@ -593,17 +601,19 @@ class QESwapHelper(AuthMixin, QObject, QtEventListener):
         coins = self._wallet.wallet.get_spendable_coins()
         if onchain_amount == '!':
             max_amount = sum(c.value_sats() for c in coins)
-            max_swap_amount = self._wallet.wallet.lnworker.swap_manager.max_amount_forward_swap()
+            max_swap_amount = self._wallet.wallet.lnworker.swap_manager.client_max_amount_forward_swap()
             if max_swap_amount is None:
-                raise InvalidSwapParameters("swap_manager.max_amount_forward_swap() is None")
+                raise InvalidSwapParameters("swap_manager.client_max_amount_forward_swap() is None")
             if max_amount > max_swap_amount:
                 onchain_amount = max_swap_amount
         outputs = [PartialTxOutput.from_address_and_value(DummyAddress.SWAP, onchain_amount)]
+        fee_policy = FeePolicy(self._wallet.wallet.config.FEE_POLICY)
         try:
             tx = self._wallet.wallet.make_unsigned_transaction(
                 coins=coins,
                 outputs=outputs,
                 send_change_to_lightning=False,
+                fee_policy=fee_policy
             )
         except (NotEnoughFunds, NoDynamicFeeEstimates) as e:
             raise InvalidSwapParameters(str(e)) from e
@@ -631,10 +641,7 @@ class QESwapHelper(AuthMixin, QObject, QtEventListener):
                     txid = fut.result()
                     try:  # swaphelper might be destroyed at this point
                         if txid:
-                            self.userinfo = ' '.join([
-                                _('Success!'),
-                                messages.MSG_REVERSE_SWAP_FUNDING_MEMPOOL,
-                            ])
+                            self.userinfo = _('Success!')
                             self.state = QESwapHelper.State.Success
                         else:
                             self.userinfo = _('Swap failed!')

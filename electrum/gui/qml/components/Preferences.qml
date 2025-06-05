@@ -236,6 +236,24 @@ Pane {
                         Layout.fillWidth: true
                         spacing: 0
                         Switch {
+                            id: psbtNostr
+                            onCheckedChanged: {
+                                if (activeFocus)
+                                    AppController.setPluginEnabled('psbt_nostr', checked)
+                            }
+                        }
+                        Label {
+                            Layout.fillWidth: true
+                            text: qsTr('Nostr Cosigner')
+                            wrapMode: Text.Wrap
+                        }
+                    }
+
+                    RowLayout {
+                        Layout.columnSpan: 2
+                        Layout.fillWidth: true
+                        spacing: 0
+                        Switch {
                             id: setMaxBrightnessOnQrDisplay
                             onCheckedChanged: {
                                 if (activeFocus)
@@ -267,6 +285,23 @@ Pane {
                         Label {
                             Layout.fillWidth: true
                             text: qsTr('Spend unconfirmed')
+                            wrapMode: Text.Wrap
+                        }
+                    }
+
+                    RowLayout {
+                        Layout.columnSpan: 2
+                        spacing: 0
+                        Switch {
+                            id: freezeReusedAddressUtxos
+                            onCheckedChanged: {
+                                if (activeFocus)
+                                    Config.freezeReusedAddressUtxos = checked
+                            }
+                        }
+                        Label {
+                            Layout.fillWidth: true
+                            text: Config.shortDescFor('WALLET_FREEZE_REUSED_ADDRESS_UTXOS')
                             wrapMode: Text.Wrap
                         }
                     }
@@ -381,24 +416,6 @@ Pane {
                         }
                     }
 
-                    RowLayout {
-                        Layout.columnSpan: 2
-                        Layout.fillWidth: true
-                        spacing: 0
-                        Switch {
-                            id: useFallbackAddress
-                            onCheckedChanged: {
-                                if (activeFocus)
-                                    Config.useFallbackAddress = checked
-                            }
-                        }
-                        Label {
-                            Layout.fillWidth: true
-                            text: qsTr('Create lightning invoices with on-chain fallback address')
-                            wrapMode: Text.Wrap
-                        }
-                    }
-
                     PrefsHeading {
                         Layout.columnSpan: 2
                         text: qsTr('Advanced')
@@ -459,12 +476,13 @@ Pane {
         rateSources.currentIndex = rateSources.indexOfValue(Daemon.fx.rateSource)
         fiatEnable.checked = Daemon.fx.enabled
         spendUnconfirmed.checked = Config.spendUnconfirmed
+        freezeReusedAddressUtxos.checked = Config.freezeReusedAddressUtxos
         useTrampolineRouting.checked = !Config.useGossip
-        useFallbackAddress.checked = Config.useFallbackAddress
         enableDebugLogs.checked = Config.enableDebugLogs
         alwaysAllowScreenshots.checked = Config.alwaysAllowScreenshots
         setMaxBrightnessOnQrDisplay.checked = Config.setMaxBrightnessOnQrDisplay
         useRecoverableChannels.checked = Config.useRecoverableChannels
         syncLabels.checked = AppController.isPluginEnabled('labels')
+        psbtNostr.checked = AppController.isPluginEnabled('psbt_nostr')
     }
 }

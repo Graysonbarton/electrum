@@ -12,23 +12,25 @@ ElDialog {
     id: dialog
 
     title: qsTr('Receive Payment')
+    iconSource: Qt.resolvedUrl('../../icons/tab_receive.png')
 
     property string key
+    property bool isLightning: request.isLightning
 
     property string _bolt11: request.bolt11
     property string _bip21uri: request.bip21
     property string _address: request.address
-
     property bool _render_qr: false // delay qr rendering until dialog is shown
 
-    property bool _ispaid: false
-
-    iconSource: Qt.resolvedUrl('../../icons/tab_receive.png')
+    signal requestPaid
 
     padding: 0
 
+    function getPaidTxid() {
+        return request.paidTxid
+    }
+
     ColumnLayout {
-        visible: !_ispaid
         anchors.fill: parent
         spacing: 0
 
@@ -40,7 +42,7 @@ ElDialog {
             rightMargin: constants.paddingLarge
 
             contentHeight: rootLayout.height
-            clip:true
+            clip: true
             interactive: height < contentHeight
 
             ColumnLayout {
@@ -153,12 +155,12 @@ ElDialog {
                 icon.color: 'transparent'
                 text: 'Copy'
                 onClicked: {
-                    if (request.isLightning && rootLayout.state == 'bolt11')
-                        AppController.textToClipboard(_bolt11.toLowerCase())
-                    else if (rootLayout.state == 'bip21uri')
-                        AppController.textToClipboard(_bip21uri)
-                    else
-                        AppController.textToClipboard(_address)
+                    AppController.textToClipboard(_bolt11
+                        ? _bolt11.toLowerCase()
+                        : _bip21uri
+                            ? _bip21uri
+                            : _address
+                    )
                     toaster.show(this, qsTr('Copied!'))
                 }
             }
@@ -170,47 +172,19 @@ ElDialog {
                 text: 'Share'
                 onClicked: {
                     enabled = false
-                    if (request.isLightning && rootLayout.state == 'bolt11')
-                        AppController.doShare(_bolt11.toLowerCase(), qsTr('Payment Request'))
-                    else if (rootLayout.state == 'bip21uri')
-                        AppController.doShare(_bip21uri, qsTr('Payment Request'))
-                    else
-                        AppController.doShare(_address, qsTr('Onchain address'))
-
+                    AppController.doShare(
+                        _bolt11
+                            ? _bolt11.toLowerCase()
+                            : _bip21uri
+                                ? _bip21uri
+                                : _address,
+                        _bolt11 || _bip21uri
+                            ? qsTr('Payment Request')
+                            : qsTr('Onchain address')
+                    )
                     enabled = true
                 }
             }
-        }
-    }
-
-    ColumnLayout {
-        visible: _ispaid
-        anchors.centerIn: parent
-        states: [
-            State {
-                name: 'paid'
-                when: _ispaid
-            }
-        ]
-        transitions: [
-            Transition {
-                from: ''
-                to: 'paid'
-                NumberAnimation { target: paidIcon; properties: 'opacity'; from: 0; to: 1; duration: 200 }
-                NumberAnimation { target: paidIcon; properties: 'scale'; from: 0; to: 1; duration: 500; easing.type: Easing.OutBack; easing.overshoot: 10 }
-            }
-        ]
-        Image {
-            id: paidIcon
-            Layout.alignment: Qt.AlignHCenter
-            Layout.preferredWidth: constants.iconSizeXXLarge
-            Layout.preferredHeight: constants.iconSizeXXLarge
-            source: '../../icons/confirmed.png'
-        }
-        Label {
-            Layout.alignment: Qt.AlignHCenter
-            text: qsTr('Paid!')
-            font.pixelSize: constants.fontSizeXXLarge
         }
     }
 
@@ -219,7 +193,7 @@ ElDialog {
         wallet: Daemon.currentWallet
         onStatusChanged: {
             if (status == RequestDetails.Paid || status == RequestDetails.Unconfirmed) {
-                _ispaid = true
+                requestPaid()
             }
         }
     }

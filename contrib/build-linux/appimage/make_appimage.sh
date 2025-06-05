@@ -136,13 +136,9 @@ break_legacy_easy_install
 
 info "preparing electrum-locale."
 (
-    cd "$PROJECT_ROOT"
-    git submodule update --init
-
-    LOCALE="$PROJECT_ROOT/electrum/locale/"
+    "$CONTRIB/locale/build_cleanlocale.sh"
     # we want the binary to have only compiled (.mo) locale files; not source (.po) files
-    rm -rf "$LOCALE"
-    "$CONTRIB/build_locale.sh" "$CONTRIB/deterministic-build/electrum-locale/locale/" "$LOCALE"
+    rm -r "$PROJECT_ROOT/electrum/locale/locale"/*/electrum.po
 )
 
 
@@ -160,8 +156,13 @@ info "Installing build dependencies."
 "$python" -m pip install --no-build-isolation --no-dependencies --no-binary :all: --no-warn-script-location \
     --cache-dir "$PIP_CACHE_DIR" -r "$CONTRIB/deterministic-build/requirements-build-appimage.txt"
 
-info "installing electrum and its dependencies."
+
+# opt out of compiling C extensions
+export YARL_NO_EXTENSIONS=1
+
 export ELECTRUM_ECC_DONT_COMPILE=1
+
+info "installing electrum and its dependencies."
 "$python" -m pip install --no-build-isolation --no-dependencies --no-binary :all: --no-warn-script-location \
     --cache-dir "$PIP_CACHE_DIR" -r "$CONTRIB/deterministic-build/requirements.txt"
 "$python" -m pip install --no-build-isolation --no-dependencies --no-binary :all: --only-binary PyQt6,PyQt6-Qt6,cryptography --no-warn-script-location \

@@ -6,14 +6,15 @@ from electrum.i18n import _
 from electrum.logging import get_logger
 from electrum.bitcoin import DummyAddress
 from electrum.util import format_time, TxMinedInfo
-from electrum.transaction import tx_from_any, Transaction, PartialTxInput, Sighash, PartialTransaction, TxOutpoint
+from electrum.transaction import tx_from_any, Transaction, PartialTransaction
 from electrum.network import Network
 from electrum.address_synchronizer import TX_HEIGHT_UNCONF_PARENT, TX_HEIGHT_UNCONFIRMED, TX_HEIGHT_FUTURE
 from electrum.wallet import TxSighashDanger
+from electrum.fee_policy import FeePolicy
 
 from .qewallet import QEWallet
 from .qetypes import QEAmount
-from .util import QtEventListener, event_listener
+from .util import QtEventListener, qt_event_listener
 
 
 class QETxDetails(QObject, QtEventListener):
@@ -21,7 +22,7 @@ class QETxDetails(QObject, QtEventListener):
 
     confirmRemoveLocalTx = pyqtSignal([str], arguments=['message'])
     txRemoved = pyqtSignal()
-    saveTxError = pyqtSignal([str,str], arguments=['code', 'message'])
+    saveTxError = pyqtSignal([str, str], arguments=['code', 'message'])
     saveTxSuccess = pyqtSignal()
 
     detailsChanged = pyqtSignal()
@@ -58,6 +59,7 @@ class QETxDetails(QObject, QtEventListener):
         self._is_complete = False
         self._is_mined = False
         self._is_rbf_enabled = False
+        self._is_removed = False
         self._lock_delay = 0
         self._sighash_danger = TxSighashDanger()
 
@@ -73,22 +75,24 @@ class QETxDetails(QObject, QtEventListener):
     def on_destroy(self):
         self.unregister_callbacks()
 
-    @event_listener
+    @qt_event_listener
     def on_event_verified(self, wallet, txid, info):
         if wallet == self._wallet.wallet and txid == self._txid:
             self._logger.debug(f'verified event for our txid {txid}')
             self.update()
 
-    @event_listener
+    @qt_event_listener
     def on_event_new_transaction(self, wallet, tx):
         if wallet == self._wallet.wallet and tx.txid() == self._txid:
             self._logger.debug(f'new_transaction event for our txid {self._txid}')
             self.update()
 
-    @event_listener
+    @qt_event_listener
     def on_event_removed_transaction(self, wallet, tx):
         if wallet == self._wallet.wallet and tx.txid() == self._txid:
             self._logger.debug(f'removed my transaction {tx.txid()}')
+            self._is_removed = True
+            self.update()
             self.txRemoved.emit()
 
     walletChanged = pyqtSignal()
@@ -183,6 +187,10 @@ class QETxDetails(QObject, QtEventListener):
     def isMined(self):
         return self._is_mined
 
+    @pyqtProperty(bool, notify=detailsChanged)
+    def isRemoved(self):
+        return self._is_removed
+
     @pyqtProperty(str, notify=detailsChanged)
     def mempoolDepth(self):
         return self._mempool_depth
@@ -266,6 +274,20 @@ class QETxDetails(QObject, QtEventListener):
     def update(self, from_txid: bool = False):
         assert self._wallet
 
+        if self._is_removed:
+            self._logger.debug('tx removed, disable gui options')
+            self._can_broadcast = False
+            self._can_bump = False
+            self._can_dscancel = False
+            self._can_cpfp = False
+            self._can_save_as_local = False
+            self._can_remove = False
+            self._can_sign = False
+            self._mempool_depth = ''
+            self._status = _('removed')
+            self.detailsChanged.emit()
+            return
+
         if from_txid:
             self._tx = self._wallet.wallet.db.get_transaction(self._txid)
             assert self._tx is not None, f'unknown txid "{self._txid}"'
@@ -327,7 +349,7 @@ class QETxDetails(QObject, QtEventListener):
             self.update_mined_status(txinfo.tx_mined_status)
         else:
             if txinfo.tx_mined_status.height in [TX_HEIGHT_UNCONFIRMED, TX_HEIGHT_UNCONF_PARENT]:
-                self._mempool_depth = self._wallet.wallet.config.depth_tooltip(txinfo.mempool_depth_bytes)
+                self._mempool_depth = FeePolicy.depth_tooltip(txinfo.mempool_depth_bytes)
                 self._in_mempool = True
             elif txinfo.tx_mined_status.height == TX_HEIGHT_FUTURE:
                 self._lock_delay = txinfo.tx_mined_status.wanted_height - self._wallet.wallet.adb.get_local_height()
@@ -361,9 +383,11 @@ class QETxDetails(QObject, QtEventListener):
 
         self.detailsChanged.emit()
 
-        if self._label != txinfo.label:
-            self._label = txinfo.label
-            self.labelChanged.emit()
+        if self._txid:
+            label = self._wallet.wallet.get_label_for_txid(self._txid)
+            if self._label != label:
+                self._label = label
+                self.labelChanged.emit()
 
     def update_mined_status(self, tx_mined_info: TxMinedInfo):
         self._mempool_depth = ''
@@ -483,4 +507,5 @@ class QETxDetails(QObject, QtEventListener):
     @pyqtSlot(result='QVariantList')
     def getSerializedTx(self):
         txqr = self._tx.to_qr_data()
-        return [str(self._tx), txqr[0], txqr[1]]
+        label = self._wallet.wallet.get_label_for_txid(self._tx.txid())
+        return [str(self._tx), txqr[0], txqr[1], label]

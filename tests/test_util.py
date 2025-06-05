@@ -1,3 +1,4 @@
+import asyncio
 from datetime import datetime
 from decimal import Decimal
 
@@ -324,6 +325,13 @@ class TestUtil(ElectrumTestCase):
         self.assertTrue(is_private_netaddress("[::1]"))
         self.assertTrue(is_private_netaddress("localhost"))
         self.assertTrue(is_private_netaddress("localhost."))
+        self.assertTrue(is_private_netaddress("192.168.1.1"))  # RFC1918
+        self.assertTrue(is_private_netaddress("10.10.10.10"))  # RFC1918
+        self.assertTrue(is_private_netaddress("172.16.0.1"))   # RFC1918
+        self.assertTrue(is_private_netaddress("172.31.255.254"))  # RFC1918
+        self.assertTrue(is_private_netaddress("::ffff:ac10:0001"))  # RFC1918 IPv4 in IPv6
+        self.assertTrue(is_private_netaddress("[::ffff:c0a8:0001]"))  # RFC1918 IPv4 in IPv6
+        self.assertTrue(is_private_netaddress("fe80::0001"))  # IPv6 link-local
         self.assertFalse(is_private_netaddress("[::2]"))
         self.assertFalse(is_private_netaddress("2a00:1450:400e:80d::200e"))
         self.assertFalse(is_private_netaddress("[2a00:1450:400e:80d::200e]"))
@@ -471,4 +479,41 @@ class TestUtil(ElectrumTestCase):
         self.assertTrue(ShortID.from_components(3, 30, 300) > ShortID.from_components(3, 1, 1))
         self.assertTrue(ShortID.from_components(3, 30, 300) > ShortID.from_components(3, 1, 999))
         self.assertTrue(ShortID.from_components(3, 30, 300) < ShortID.from_components(3, 999, 1))
+
+    async def test_custom_task_factory(self):
+        loop = util.get_running_loop()
+        # set our factory.  note: this does not leak into other unit tests
+        util._set_custom_task_factory(loop)
+
+        evt = asyncio.Event()
+        async def foo():
+            await evt.wait()
+
+        # spawn tasks
+        fut = asyncio.ensure_future(foo())
+        self.assertTrue(fut in util._running_asyncio_tasks)
+        fut = asyncio.create_task(foo())
+        self.assertTrue(fut in util._running_asyncio_tasks)
+        fut = loop.create_task(foo())
+        self.assertTrue(fut in util._running_asyncio_tasks)
+        fut = asyncio.run_coroutine_threadsafe(foo(), loop=loop)
+        # run_coroutine_threadsafe will create a different (chained) future in _running_asyncio_tasks
+        # (which btw will only happen a few event loop iterations later)
+        #self.assertTrue(fut in util._running_asyncio_tasks)
+
+        # wait a few event loop iterations
+        for _ in range(10):
+            await asyncio.sleep(0)
+        # we should have stored one ref for each above.
+        # (though what if test framework is doing stuff ~concurrently?)
+        self.assertEqual(4, len(util._running_asyncio_tasks))
+        for task in util._running_asyncio_tasks:
+            self.assertEqual(foo.__qualname__, task.get_coro().__qualname__)
+        # let tasks finish
+        evt.set()
+        # wait a few event loop iterations
+        for _ in range(10):
+            await asyncio.sleep(0)
+        # refs should be cleaned up by now:
+        self.assertEqual(0, len(util._running_asyncio_tasks))
 

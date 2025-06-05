@@ -128,18 +128,20 @@ pyinstaller --version
 
 rm -rf ./dist
 
-git submodule update --init
+info "resetting git submodules."
+# note: --force is less critical in other build scripts, but as the mac build is not doing a fresh clone,
+#       it is very useful here for reproducibility
+git submodule update --init --force
 
-info "generating locale"
+info "preparing electrum-locale."
 (
     if ! which msgfmt > /dev/null 2>&1; then
         brew install gettext
         brew link --force gettext
     fi
-    LOCALE="$PROJECT_ROOT/electrum/locale/"
+    "$CONTRIB/locale/build_cleanlocale.sh"
     # we want the binary to have only compiled (.mo) locale files; not source (.po) files
-    rm -rf "$LOCALE"
-    "$CONTRIB/build_locale.sh" "$CONTRIB/deterministic-build/electrum-locale/locale/" "$LOCALE"
+    rm -r "$PROJECT_ROOT/electrum/locale/locale"/*/electrum.po
 ) || fail "failed generating locale"
 
 
@@ -168,8 +170,12 @@ fi
 cp -f "$DLL_TARGET_DIR/libusb-1.0.dylib" "$PROJECT_ROOT/electrum/" || fail "Could not copy libusb dylib"
 
 
-info "Installing requirements..."
+# opt out of compiling C extensions
+export YARL_NO_EXTENSIONS=1
+
 export ELECTRUM_ECC_DONT_COMPILE=1
+
+info "Installing requirements..."
 python3 -m pip install --no-build-isolation --no-dependencies --no-binary :all: \
     --no-warn-script-location \
     -Ir ./contrib/deterministic-build/requirements.txt \

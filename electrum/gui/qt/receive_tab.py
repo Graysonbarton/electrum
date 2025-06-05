@@ -10,13 +10,13 @@ from PyQt6.QtWidgets import (QLabel, QVBoxLayout, QGridLayout, QTextEdit,
                              QHBoxLayout, QPushButton, QWidget, QSizePolicy, QFrame)
 
 from electrum.i18n import _
-from electrum.util import InvoiceError
+from electrum.util import InvoiceError, ChoiceItem
 from electrum.invoices import pr_expiration_values
 from electrum.logging import Logger
 
 from .amountedit import AmountEdit, BTCAmountEdit, SizedFreezableLineEdit
 from .qrcodewidget import QRCodeWidget
-from .util import read_QIcon, WWLabel, MessageBoxMixin, MONOSPACE_FONT, get_iconname_qrcode
+from .util import read_QIcon, WWLabel, MessageBoxMixin, MONOSPACE_FONT, get_icon_qrcode
 
 if TYPE_CHECKING:
     from .main_window import ElectrumWindow
@@ -98,6 +98,8 @@ class ReceiveTab(QWidget, MessageBoxMixin, Logger):
         self.receive_help_text.setLayout(QHBoxLayout())
         self.receive_rebalance_button = QPushButton('Rebalance')
         self.receive_rebalance_button.suggestion = None
+        self.receive_zeroconf_button = QPushButton(_('Accept'))
+        self.receive_zeroconf_button.clicked.connect(self.on_accept_zeroconf)
 
         def on_receive_rebalance():
             if self.receive_rebalance_button.suggestion:
@@ -115,6 +117,7 @@ class ReceiveTab(QWidget, MessageBoxMixin, Logger):
         buttons = QHBoxLayout()
         buttons.addWidget(self.receive_rebalance_button)
         buttons.addWidget(self.receive_swap_button)
+        buttons.addWidget(self.receive_zeroconf_button)
         vbox = QVBoxLayout()
         vbox.addWidget(self.receive_help_text)
         vbox.addLayout(buttons)
@@ -141,15 +144,13 @@ class ReceiveTab(QWidget, MessageBoxMixin, Logger):
         self.toolbar, menu = self.request_list.create_toolbar_with_menu('')
 
         self.toggle_qr_button = QPushButton('')
-        self.toggle_qr_button.setIcon(read_QIcon(get_iconname_qrcode()))
+        self.toggle_qr_button.setIcon(get_icon_qrcode())
         self.toggle_qr_button.setToolTip(_('Switch between text and QR code view'))
         self.toggle_qr_button.clicked.connect(self.toggle_receive_qr)
         self.toggle_qr_button.setEnabled(False)
         self.toolbar.insertWidget(2, self.toggle_qr_button)
 
         # menu
-        menu.addConfig(self.config.cv.WALLET_BOLT11_FALLBACK, callback=self.on_toggle_bolt11_fallback)
-        menu.addConfig(self.config.cv.WALLET_BIP21_LIGHTNING, callback=self.update_current_request)
         self.qr_menu_action = menu.addToggle(_("Show detached QR code window"), self.window.toggle_qr_window)
         menu.addAction(_("Import requests"), self.window.import_requests)
         menu.addAction(_("Export requests"), self.window.export_requests)
@@ -194,18 +195,13 @@ class ReceiveTab(QWidget, MessageBoxMixin, Logger):
             _('For Lightning requests, payments will not be accepted after the expiration.'),
         ])
         expiry = self.config.WALLET_PAYREQ_EXPIRY_SECONDS
-        choices = list(pr_expiration_values().items())
-        v = self.window.query_choice(msg, choices, title=_('Expiry'), default_choice=expiry)
+        choices = [ChoiceItem(key=exptime, label=label)
+                   for (exptime, label) in pr_expiration_values().items()]
+        v = self.window.query_choice(msg, choices, title=_('Expiry'), default_key=expiry)
         if v is None:
             return
         self.config.WALLET_PAYREQ_EXPIRY_SECONDS = v
         self.update_expiry_text()
-
-    def on_toggle_bolt11_fallback(self):
-        if not self.wallet.lnworker:
-            return
-        self.wallet.lnworker.clear_invoices_cache()
-        self.update_current_request()
 
     def on_tab_changed(self):
         text, data, help_text, title = self.get_tab_data()
@@ -228,7 +224,10 @@ class ReceiveTab(QWidget, MessageBoxMixin, Logger):
         self.receive_widget.update_visibility(b)
 
     def update_current_request(self):
-        key = self.request_list.get_current_key()
+        if len(self.request_list.selectionModel().selectedRows(0)) > 1:
+            key = None
+        else:
+            key = self.request_list.get_current_key()
         req = self.wallet.get_request(key) if key else None
         if req is None:
             self.receive_e.setText('')
@@ -244,25 +243,36 @@ class ReceiveTab(QWidget, MessageBoxMixin, Logger):
         self.ln_help = help_texts.ln_help
         can_rebalance = help_texts.can_rebalance()
         can_swap = help_texts.can_swap()
+        can_zeroconf = help_texts.can_zeroconf()
         self.receive_rebalance_button.suggestion = help_texts.ln_rebalance_suggestion
         self.receive_swap_button.suggestion = help_texts.ln_swap_suggestion
         self.receive_rebalance_button.setVisible(can_rebalance)
         self.receive_swap_button.setVisible(can_swap)
         self.receive_rebalance_button.setEnabled(can_rebalance and self.window.num_tasks() == 0)
         self.receive_swap_button.setEnabled(can_swap and self.window.num_tasks() == 0)
+        self.receive_zeroconf_button.setVisible(can_zeroconf)
+        self.receive_zeroconf_button.setEnabled(can_zeroconf)
         text, data, help_text, title = self.get_tab_data()
         self.receive_e.setText(text)
         self.receive_qr.setData(data)
         self.receive_help_text.setText(help_text)
         for w in [self.receive_e, self.receive_qr]:
-            w.setEnabled(bool(text) and not help_text)
+            w.setEnabled(bool(text) and (not help_text or can_zeroconf))
             w.setToolTip(help_text)
         # macOS hack (similar to #4777)
         self.receive_e.repaint()
         # always show
+        if can_zeroconf:
+            # show the help message if zeroconf so user can first accept it and still sees the invoice
+            # after accepting
+            self.receive_widget.show_help()
         self.receive_widget.setVisible(True)
         self.toggle_qr_button.setEnabled(True)
         self.update_receive_qr_window()
+
+    def on_accept_zeroconf(self):
+        self.receive_zeroconf_button.setVisible(False)
+        self.update_receive_widgets()
 
     def get_tab_data(self):
         if self.URI:
@@ -382,9 +392,12 @@ class ReceiveWidget(QWidget):
             self.textedit.setVisible(not is_qr)
             self.qr.setVisible(is_qr)
         else:
-            self.help_widget.setVisible(True)
-            self.textedit.setVisible(False)
-            self.qr.setVisible(False)
+            self.show_help()
+
+    def show_help(self):
+        self.help_widget.setVisible(True)
+        self.textedit.setVisible(False)
+        self.qr.setVisible(False)
 
     def resizeEvent(self, e):
         # keep square aspect ratio when resized

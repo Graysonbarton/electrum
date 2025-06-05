@@ -1,5 +1,5 @@
 from typing import TYPE_CHECKING, Optional
-from PyQt6.QtWidgets import QLabel, QVBoxLayout, QGridLayout, QPushButton, QComboBox, QLineEdit, QSpacerItem, QWidget, QHBoxLayout
+from PyQt6.QtWidgets import QLabel, QVBoxLayout, QGridLayout, QPushButton, QComboBox, QLineEdit, QHBoxLayout
 
 import electrum_ecc as ecc
 
@@ -7,6 +7,7 @@ from electrum.i18n import _
 from electrum.lnutil import MIN_FUNDING_SAT
 from electrum.lnworker import hardcoded_trampoline_nodes
 from electrum.util import NotEnoughFunds, NoDynamicFeeEstimates
+from electrum.fee_policy import FeePolicy
 
 from .util import (WindowModalDialog, Buttons, OkButton, CancelButton,
                    EnterButton, WWLabel, char_width_in_lineedit)
@@ -92,7 +93,8 @@ class NewChannelDialog(WindowModalDialog):
         if not nodeid:
             self.remote_nodeid.setText("")
             self.remote_nodeid.setPlaceholderText(
-                "Please wait until the graph is synchronized to 30%, and then try again.")
+                _("Couldn't find suitable peer yet, try again later.")
+            )
         else:
             self.remote_nodeid.setText(nodeid)
         self.remote_nodeid.repaint()  # macOS hack for #6269
@@ -119,7 +121,7 @@ class NewChannelDialog(WindowModalDialog):
         dummy_nodeid = ecc.GENERATOR.get_public_key_bytes(compressed=True)
         make_tx = self.window.mktx_for_open_channel(funding_sat='!', node_id=dummy_nodeid)
         try:
-            tx = make_tx(None)
+            tx = make_tx(FeePolicy(self.config.FEE_POLICY))
         except (NotEnoughFunds, NoDynamicFeeEstimates) as e:
             self.max_button.setChecked(False)
             self.amount_e.setFrozen(False)

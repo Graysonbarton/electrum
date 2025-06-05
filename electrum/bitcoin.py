@@ -23,11 +23,12 @@
 # CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from typing import Tuple, TYPE_CHECKING, Optional, Union, Sequence
+from typing import Tuple, TYPE_CHECKING, Optional, Union, Sequence, Mapping, Any
 import enum
 from enum import IntEnum, Enum
 
 import electrum_ecc as ecc
+from electrum_ecc.util import bip340_tagged_hash
 
 from .util import bfh, BitcoinException, assert_bytes, to_bytes, inv_dict, is_hex_str, classproperty
 from . import segwit_addr
@@ -36,6 +37,7 @@ from .crypto import sha256d, sha256, hash_160
 
 if TYPE_CHECKING:
     from .network import Network
+    from .transaction import OPPushDataGeneric
 
 
 ################################## transactions
@@ -294,12 +296,18 @@ def construct_witness(items: Sequence[Union[str, int, bytes]]) -> bytes:
     return bytes(witness)
 
 
-def construct_script(items: Sequence[Union[str, int, bytes, opcodes]], values=None) -> bytes:
+def construct_script(
+    items: Sequence[Union[str, int, bytes, opcodes, 'OPPushDataGeneric']],
+    *,
+    values: Optional[Mapping[int, Any]] = None,  # can be used to substitute into OPPushDataGeneric
+) -> bytes:
     """Constructs bitcoin script from given items."""
+    from .transaction import OPPushDataGeneric
     script = bytearray()
     values = values or {}
     for i, item in enumerate(items):
         if i in values:
+            assert OPPushDataGeneric.is_instance(item), f"tried to substitute into {item=!r}"
             item = values[i]
         if isinstance(item, opcodes):
             script += bytes([item])
@@ -311,13 +319,13 @@ def construct_script(items: Sequence[Union[str, int, bytes, opcodes]], values=No
             assert is_hex_str(item)
             script += push_script(bfh(item))
         else:
-            raise Exception(f'unexpected item for script: {item!r}')
+            raise Exception(f'unexpected item for script: {item!r} at idx={i}')
     return bytes(script)
 
 
 def relayfee(network: 'Network' = None) -> int:
     """Returns feerate in sat/kbyte."""
-    from .simple_config import FEERATE_DEFAULT_RELAY, FEERATE_MAX_RELAY
+    from .fee_policy import FEERATE_DEFAULT_RELAY, FEERATE_MAX_RELAY
     if network and network.relay_fee is not None:
         fee = network.relay_fee
     else:
@@ -811,12 +819,6 @@ def taproot_tweak_seckey(seckey0: bytes, h: bytes) -> bytes:
 #  - a list of two elements, each with the same structure as TapTree itself
 TapTreeLeaf = Tuple[int, bytes]
 TapTree = Union[TapTreeLeaf, Sequence['TapTree']]
-
-
-# FIXME just use electrum_ecc.util.bip340_tagged_hash instead
-def bip340_tagged_hash(tag: bytes, msg: bytes) -> bytes:
-    # note: _libsecp256k1.secp256k1_tagged_sha256 benchmarks about 70% slower than this (on my machine)
-    return sha256(sha256(tag) + sha256(tag) + msg)
 
 
 def taproot_tree_helper(script_tree: TapTree):

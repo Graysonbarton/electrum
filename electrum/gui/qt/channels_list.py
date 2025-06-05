@@ -112,7 +112,7 @@ class ChannelsList(MyTreeView):
         }
 
     def on_channel_closed(self, txid):
-        self.main_window.show_error('Channel closed' + '\n' + txid)
+        self.main_window.show_message('Channel closed' + '\n' + txid)
 
     def on_failure(self, exc_info):
         type_, e, tb = exc_info
@@ -170,13 +170,7 @@ class ChannelsList(MyTreeView):
             self.lnworker.remove_channel_backup(channel_id)
 
     def export_channel_backup(self, channel_id):
-        msg = ' '.join([
-            _("Channel backups can be imported in another instance of the same wallet."),
-            _("In the Electrum mobile app, use the 'Send' button to scan this QR code."),
-            '\n\n',
-            _("Please note that channel backups cannot be used to restore your channels."),
-            _("If you lose your wallet file, the only thing you can do with a backup is to request your channel to be closed, so that your funds will be sent on-chain."),
-        ])
+        msg = messages.MSG_LN_EXPLAIN_SCB_BACKUPS
         data = self.lnworker.export_channel_backup(channel_id)
         self.main_window.show_qrcode(data, 'channel backup', help_text=msg,
                                      show_copy_text_btn=True)
@@ -374,7 +368,7 @@ class ChannelsList(MyTreeView):
         #     and maybe add item "main_window.init_lightning_dialog()" when applicable
         menu.setEnabled(self.wallet.has_lightning())
         self.new_channel_button = EnterButton(_('New Channel'), self.main_window.new_channel_dialog)
-        self.new_channel_button.setEnabled(self.wallet.has_lightning())
+        self.new_channel_button.setEnabled(self.wallet.can_have_lightning())
         toolbar.insertWidget(2, self.new_channel_button)
         return toolbar
 

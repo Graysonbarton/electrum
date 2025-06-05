@@ -172,7 +172,7 @@ ElDialog {
                     Layout.preferredWidth: amountFontMetrics.advanceWidth('0') * 14 + leftPadding + rightPadding
                     onTextAsSatsChanged: {
                         if (!is_max.checked)
-                            channelopener.amount.satsInt = amountBtc.textAsSats.satsInt
+                            channelopener.amount = amountBtc.textAsSats
                     }
                     readOnly: is_max.checked
                     color: readOnly
@@ -201,7 +201,6 @@ ElDialog {
                             if (activeFocus) {
                                 channelopener.amount.isMax = checked
                                 if (checked) {
-                                    maxAmountMessage.text = ''
                                     channelopener.updateMaxAmount()
                                 }
                             }
@@ -232,11 +231,12 @@ ElDialog {
                 Item { visible: Daemon.fx.enabled ; height: 1; width: 1 }
 
                 InfoTextArea {
+                    id: warning
                     Layout.topMargin: constants.paddingMedium
                     Layout.fillWidth: true
                     Layout.columnSpan: 3
-                    id: maxAmountMessage
-                    visible: is_max.checked && text
+                    text: channelopener.warning
+                    visible: text
                     compact: true
                 }
 
@@ -245,7 +245,7 @@ ElDialog {
 
         FlatButton {
             Layout.fillWidth: true
-            text: qsTr('Open Channel')
+            text: qsTr('Open Channel...')
             icon.source: '../../icons/confirmed.png'
             enabled: channelopener.valid
             onClicked: channelopener.openChannel()
@@ -320,9 +320,6 @@ ElDialog {
             }
             // TODO: handle incomplete TX
             root.close()
-        }
-        onMaxAmountMessage: (message) => {
-            maxAmountMessage.text = message
         }
     }
 

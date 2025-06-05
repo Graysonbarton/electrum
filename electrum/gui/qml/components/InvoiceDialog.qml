@@ -12,6 +12,7 @@ ElDialog {
 
     property Invoice invoice
     property bool payImmediately: false
+    property string broadcastTxid
 
     signal doPay
     signal invoiceAmountChanged
@@ -62,7 +63,9 @@ ElDialog {
                                 : invoice.status == Invoice.Paid
                                     ? InfoTextArea.IconStyle.Done
                                     : invoice.status == Invoice.Unpaid && invoice.expiration > 0
-                                        ? InfoTextArea.IconStyle.Pending
+                                        ? invoice.canPay
+                                            ? InfoTextArea.IconStyle.Pending
+                                            : InfoTextArea.IconStyle.Error
                                         : InfoTextArea.IconStyle.Info
                 }
 
@@ -484,10 +487,6 @@ ElDialog {
                         if (amountMax.checked)
                             invoice.amountOverride.isMax = true
                     }
-                    if (!invoice.isSaved) {
-                        // save invoice if newly parsed
-                        invoice.saveInvoice()
-                    }
                     doPay() // only signal here
                 }
             }
@@ -503,10 +502,21 @@ ElDialog {
         }
         if (payImmediately) {
             if (invoice.canPay) {
-                if (!invoice.isSaved) {
-                    invoice.saveInvoice()
-                }
                 doPay()
+            }
+        }
+    }
+
+    Connections {
+        target: Daemon.currentWallet
+        function onBroadcastSucceeded(txid) {
+            if (dialog.broadcastTxid == txid) {
+                // our txid was broadcast successfully, close invoicedialog and show success popup
+                dialog.close()
+                var successdialog = app.messageDialog.createObject(mainView, {
+                    text: qsTr('Payment sent.')
+                })
+                successdialog.open()
             }
         }
     }

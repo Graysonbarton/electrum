@@ -24,7 +24,7 @@
 # SOFTWARE.
 
 import ast
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Dict
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (QComboBox,  QTabWidget, QDialog, QSpinBox,  QCheckBox, QLabel,
@@ -121,7 +121,7 @@ class SettingsDialog(QDialog, QtEventListener):
                         _("Are you sure you want to disable trampoline?"),
                         _("Without this option, Electrum will need to sync with the Lightning network on every start."),
                         _("This may impact the reliability of your payments."),
-                ])):
+                ]), parent=self):
                     trampoline_cb.setCheckState(Qt.CheckState.Checked)
                     return
             self.config.LIGHTNING_USE_GOSSIP = not use_trampoline
@@ -130,35 +130,10 @@ class SettingsDialog(QDialog, QtEventListener):
             else:
                 self.network.run_from_another_thread(
                     self.network.stop_gossip())
-            legacy_add_trampoline_cb.setEnabled(use_trampoline)
             util.trigger_callback('ln_gossip_sync_progress')
             # FIXME: update all wallet windows
             util.trigger_callback('channels_updated', self.wallet)
         trampoline_cb.stateChanged.connect(on_trampoline_checked)
-
-        legacy_add_trampoline_cb = checkbox_from_configvar(self.config.cv.LIGHTNING_LEGACY_ADD_TRAMPOLINE)
-        legacy_add_trampoline_cb.setChecked(self.config.LIGHTNING_LEGACY_ADD_TRAMPOLINE)
-        legacy_add_trampoline_cb.setEnabled(trampoline_cb.isChecked())
-
-        def on_legacy_add_trampoline_checked(_x):
-            self.config.LIGHTNING_LEGACY_ADD_TRAMPOLINE = legacy_add_trampoline_cb.isChecked()
-        legacy_add_trampoline_cb.stateChanged.connect(on_legacy_add_trampoline_checked)
-
-        remote_wt_cb = checkbox_from_configvar(self.config.cv.WATCHTOWER_CLIENT_ENABLED)
-        remote_wt_cb.setChecked(self.config.WATCHTOWER_CLIENT_ENABLED)
-
-        def on_remote_wt_checked(_x):
-            self.config.WATCHTOWER_CLIENT_ENABLED = remote_wt_cb.isChecked()
-            self.watchtower_url_e.setEnabled(remote_wt_cb.isChecked())
-        remote_wt_cb.stateChanged.connect(on_remote_wt_checked)
-        watchtower_url = self.config.WATCHTOWER_CLIENT_URL
-        self.watchtower_url_e = QLineEdit(watchtower_url)
-        self.watchtower_url_e.setEnabled(self.config.WATCHTOWER_CLIENT_ENABLED)
-
-        def on_wt_url():
-            url = self.watchtower_url_e.text() or None
-            self.config.WATCHTOWER_CLIENT_URL = url
-        self.watchtower_url_e.editingFinished.connect(on_wt_url)
 
         lnfee_hlabel = HelpLabel.from_configvar(self.config.cv.LIGHTNING_PAYMENT_FEE_MAX_MILLIONTHS)
         lnfee_map = [500, 1_000, 3_000, 5_000, 10_000, 20_000, 30_000, 50_000]
@@ -201,13 +176,6 @@ class SettingsDialog(QDialog, QtEventListener):
         self.set_alias_color()
         self.alias_e.editingFinished.connect(self.on_alias_edit)
 
-        nostr_relays_label = HelpLabel.from_configvar(self.config.cv.NOSTR_RELAYS)
-        nostr_relays = self.config.NOSTR_RELAYS
-        self.nostr_relays_e = QLineEdit(nostr_relays)
-
-        def on_nostr_edit():
-            self.config.NOSTR_RELAYS = str(self.nostr_relays_e.text())
-        self.nostr_relays_e.editingFinished.connect(on_nostr_edit)
 
         msat_cb = checkbox_from_configvar(self.config.cv.BTC_AMOUNTS_PREC_POST_SAT)
         msat_cb.setChecked(self.config.BTC_AMOUNTS_PREC_POST_SAT > 0)
@@ -410,8 +378,6 @@ class SettingsDialog(QDialog, QtEventListener):
         units_widgets.append((thousandsep_cb, None))
         lightning_widgets = []
         lightning_widgets.append((trampoline_cb, None))
-        lightning_widgets.append((legacy_add_trampoline_cb, None))
-        lightning_widgets.append((remote_wt_cb, self.watchtower_url_e))
         lightning_widgets.append((lnfee_hlabel, lnfee_hbox_w))
         fiat_widgets = []
         fiat_widgets.append((QLabel(_('Fiat currency')), ccy_combo))
@@ -420,7 +386,6 @@ class SettingsDialog(QDialog, QtEventListener):
         misc_widgets = []
         misc_widgets.append((updatecheck_cb, None))
         misc_widgets.append((filelogging_cb, None))
-        misc_widgets.append((nostr_relays_label, self.nostr_relays_e))
         misc_widgets.append((alias_label, self.alias_e))
         misc_widgets.append((qr_label, qr_combo))
 
